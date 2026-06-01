@@ -1,0 +1,100 @@
+# Copyright 2026 NVIDIA CORPORATION
+# SPDX-License-Identifier: Apache-2.0
+
+# Adversarial demo: KAI schedules a pod that the kubelet rejects on NUMA grounds.
+#
+# Node:  2 NUMA zones (~96 CPUs each), total allocatable 191 CPUs.
+# Kubelet Topology Manager: policy=restricted, scope=pod  (see nrt.yaml).
+# Requires CPU Manager static policy on the node (the NRT/Guaranteed setup implies it).
+#
+# All pods are Guaranteed QoS (requests==limits, integer CPU) so they engage the
+# CPU Manager + Topology Manager. Do NOT set nodeName: that would bypass KAI.
+#
+# Apply in order, or all at once on the single-node cluster:
+#   kubectl apply -f numa-adversarial.yaml
+#
+# Expected result:
+#   pad-a, pad-b  -> Running (one per NUMA node; 50+50 > 96 forces the split)
+#   numa-victim   -> KAI binds it, kubelet Admission fails with:
+#                    "Topology Affinity Error" / reason: TopologyAffinityError
+#
+# Observe:
+#   kubectl get pods -w
+#   kubectl describe pod numa-victim   # look for TopologyAffinityError
+#   kubectl get events --field-selector reason=TopologyAffinityError
+---
+# Padding pod A: 50 CPUs -> pinned to a single NUMA node by Topology Manager.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pad-a
+  labels:
+    kai.scheduler/queue: default-queue
+    demo: numa-adversarial
+spec:
+  schedulerName: kai-scheduler
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: main
+      image: ubuntu
+      args: ["sleep", "infinity"]
+      resources:
+        requests:
+          cpu: "50"
+          memory: 1Gi
+        limits:
+          cpu: "50"
+          memory: 1Gi
+---
+# Padding pod B: 50 CPUs. 50+50 = 100 > 96 (single NUMA capacity), so the kubelet
+# CANNOT co-locate it with pad-a -> it is forced onto the OTHER NUMA node.
+# Net result: node-0 free ~45, node-1 free ~46  (combined ~91, but fragmented).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pad-b
+  labels:
+    kai.scheduler/queue: default-queue
+    demo: numa-adversarial
+spec:
+  schedulerName: kai-scheduler
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: main
+      image: ubuntu
+      args: ["sleep", "infinity"]
+      resources:
+        requests:
+          cpu: "50"
+          memory: 1Gi
+        limits:
+          cpu: "50"
+          memory: 1Gi
+---
+# Victim: requests 80 CPUs.
+#   KAI:     node has 191 - 100 = 91 free >= 80  -> SCHEDULES (NUMA-blind).
+#   Kubelet: 80 <= 96 => preferred affinity is a SINGLE NUMA node, but neither
+#            node has 80 free (45 / 46). Only a 2-NUMA-node allocation fits, which
+#            is NOT preferred -> restricted policy REJECTS admission.
+# => Pod ends up Failed with TopologyAffinityError despite being "scheduled".
+apiVersion: v1
+kind: Pod
+metadata:
+  name: numa-victim
+  labels:
+    kai.scheduler/queue: default-queue
+    demo: numa-adversarial
+spec:
+  schedulerName: kai-scheduler
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: main
+      image: ubuntu
+      args: ["sleep", "infinity"]
+      resources:
+        requests:
+          cpu: "80"
+          memory: 1Gi
+        limits:
+          cpu: "80"
+          memory: 1Gi

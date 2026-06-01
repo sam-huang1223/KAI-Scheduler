@@ -16,6 +16,9 @@ import (
 
 const (
 	minimalSupportedVersion = "v1beta1"
+
+	nodeResourceTopologyGroupName = "topology.node.k8s.io"
+	nodeResourceTopologyVersion   = "v1alpha2"
 )
 
 // dynamicResourcesEnabled is the process-wide decision on whether DRA is usable,
@@ -41,6 +44,55 @@ func DynamicResourcesEnabled() bool {
 // SetDRAFeatureGate (which requires a discovery client).
 func SetDynamicResourcesEnabledForTest(enabled bool) {
 	dynamicResourcesEnabled.Store(enabled)
+}
+
+// nodeResourceTopologyEnabled is the process-wide decision on whether the
+// NodeResourceTopology (NRT) CRD is served by the cluster, set by
+// SetNodeResourceTopologyFeatureGate. It gates ingestion of NRT objects: when
+// the CRD is absent, registering an informer for it would block cache sync
+// forever, so the scheduler must not attempt to list/watch it.
+var nodeResourceTopologyEnabled atomic.Bool
+
+func SetNodeResourceTopologyFeatureGate(discoveryClient discovery.DiscoveryInterface) {
+	nodeResourceTopologyEnabled.Store(IsNodeResourceTopologyEnabled(discoveryClient))
+}
+
+// NodeResourceTopologyEnabled reports whether the NRT CRD was determined to be
+// served by the cluster at startup. Use this to gate NUMA-topology behaviour.
+func NodeResourceTopologyEnabled() bool {
+	return nodeResourceTopologyEnabled.Load()
+}
+
+// SetNodeResourceTopologyEnabledForTest sets the process-wide NRT availability
+// flag. Intended for tests that construct scheduler components without going
+// through SetNodeResourceTopologyFeatureGate (which requires a discovery client).
+func SetNodeResourceTopologyEnabledForTest(enabled bool) {
+	nodeResourceTopologyEnabled.Store(enabled)
+}
+
+// IsNodeResourceTopologyEnabled reports whether the cluster serves the
+// NodeResourceTopology CRD (group topology.node.k8s.io, version v1alpha2).
+func IsNodeResourceTopologyEnabled(discoveryClient discovery.DiscoveryInterface) bool {
+	logger := log.Log.WithName("feature-gates")
+
+	serverGroups, err := discoveryClient.ServerGroups()
+	if err != nil {
+		logger.Error(err, "Failed to get server groups")
+		return false
+	}
+
+	for _, group := range serverGroups.Groups {
+		if group.Name != nodeResourceTopologyGroupName {
+			continue
+		}
+		for _, groupVersion := range group.Versions {
+			if groupVersion.Version == nodeResourceTopologyVersion {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 func IsDynamicResourcesEnabled(discoveryClient discovery.DiscoveryInterface) bool {

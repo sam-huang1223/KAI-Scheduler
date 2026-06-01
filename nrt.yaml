@@ -1,0 +1,50 @@
+# Copyright 2026 NVIDIA CORPORATION
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: topology.node.k8s.io/v1alpha2
+attributes:
+- name: topologyManagerPolicy
+  value: restricted
+- name: topologyManagerScope
+  value: pod
+- name: nodeTopologyPodsFingerprint
+  value: pfp0v001b24aebbb405ee704
+kind: NodeResourceTopology
+metadata:
+  creationTimestamp: "2026-05-31T08:49:05Z"
+  generation: 41
+  name: ip-192-168-87-146.ec2.internal
+  ownerReferences:
+  - apiVersion: v1
+    kind: Namespace
+    name: node-feature-discovery
+    uid: af1ad83a-85ec-4c8f-9e27-83172bb9a197
+  resourceVersion: "682370"
+  uid: 53e5bc82-ec3e-4655-9543-aecfc91b5962
+topologyPolicies:
+- RestrictedPodLevel
+zones:
+- costs:
+  - name: node-0
+    value: 10
+  - name: node-1
+    value: 32
+  name: node-0
+  resources:
+  - allocatable: "95"
+    available: "95"
+    capacity: "96"
+    name: cpu
+  type: Node
+- costs:
+  - name: node-0
+    value: 32
+  - name: node-1
+    value: 10
+  name: node-1
+  resources:
+  - allocatable: "96"
+    available: "96"
+    capacity: "96"
+    name: cpu
+  type: Node

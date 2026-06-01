@@ -1,0 +1,106 @@
+# Copyright 2026 NVIDIA CORPORATION
+# SPDX-License-Identifier: Apache-2.0
+
+# Adversarial demo: the STOCK k8s scheduler places a pod the kubelet rejects on NUMA grounds.
+#
+# Node:  2 NUMA zones, ~96 CPUs each, total allocatable 191 CPUs (see nrt.yaml).
+# Kubelet Topology Manager: policy=restricted, scope=pod.
+# Requires CPU Manager static policy on the node (the NRT/Guaranteed setup implies it).
+#
+# The `restricted` quirk being demonstrated (see README "How the kubelet decides"):
+#   `restricted` admits only if the best merged hint is Preferred, where Preferred ==
+#   minimal NUMA-node width. The CPU Manager derives that minimal width from per-node
+#   CAPACITY (96), not current availability. So a request <= 96 has minimal width 1 and
+#   its ONLY preferred hint is a single zone. If fragmentation leaves no single zone with
+#   enough FREE CPU, the only feasible allocation spans 2 zones -> non-preferred -> reject.
+#
+# All pods are Guaranteed QoS (requests==limits, integer CPU) so they engage the
+# CPU Manager + Topology Manager. schedulerName is the stock default-scheduler, which is
+# NUMA-blind and binds on whole-node free count alone.
+#
+# Apply all at once on the single-node cluster:
+#   kubectl apply -f numa-adversarial-default-sched.yaml
+#
+# Expected result:
+#   pad-a, pad-b  -> Running (one per NUMA node; 50+50 > 96 forces the split)
+#   numa-victim   -> default-scheduler binds it, kubelet Admission fails with:
+#                    reason: TopologyAffinityError
+#
+# Observe:
+#   kubectl get pods -w
+#   kubectl describe pod numa-victim | grep -i topology
+#   kubectl get events --field-selector reason=TopologyAffinityError
+---
+# Padding pod A: 50 CPUs -> pinned to a single NUMA node by the Topology Manager.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pad-a
+  labels:
+    demo: numa-adversarial-default
+spec:
+  schedulerName: default-scheduler
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: main
+      image: ubuntu
+      args: ["sleep", "infinity"]
+      resources:
+        requests:
+          cpu: "50"
+          memory: 1Gi
+        limits:
+          cpu: "50"
+          memory: 1Gi
+---
+# Padding pod B: 50 CPUs. 50+50 = 100 > 96 (single NUMA capacity), so the kubelet
+# CANNOT co-locate it with pad-a -> it is forced onto the OTHER NUMA node.
+# Net result: node-0 free ~45, node-1 free ~46  (combined ~91, but fragmented).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pad-b
+  labels:
+    demo: numa-adversarial-default
+spec:
+  schedulerName: default-scheduler
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: main
+      image: ubuntu
+      args: ["sleep", "infinity"]
+      resources:
+        requests:
+          cpu: "50"
+          memory: 1Gi
+        limits:
+          cpu: "50"
+          memory: 1Gi
+---
+# Victim: requests 80 CPUs.
+#   default-scheduler: node has 191 - 100 = 91 free >= 80 -> BINDS (NUMA-blind).
+#   Kubelet:           80 <= 96 => minimal width is 1, so the only preferred hint is a
+#                      SINGLE NUMA node; but neither node has 80 free (45 / 46). Only a
+#                      2-NUMA-node allocation fits, which is NOT preferred -> restricted
+#                      policy REJECTS admission.
+# => Pod ends up Failed with TopologyAffinityError despite being "scheduled".
+apiVersion: v1
+kind: Pod
+metadata:
+  name: numa-victim
+  labels:
+    demo: numa-adversarial-default
+spec:
+  schedulerName: default-scheduler
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: main
+      image: ubuntu
+      args: ["sleep", "infinity"]
+      resources:
+        requests:
+          cpu: "80"
+          memory: 1Gi
+        limits:
+          cpu: "80"
+          memory: 1Gi

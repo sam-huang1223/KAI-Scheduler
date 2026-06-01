@@ -9,6 +9,8 @@ import (
 	scheduling "k8s.io/api/scheduling/v1"
 	storage "k8s.io/api/storage/v1"
 
+	nrtapi "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
+
 	kaiv1alpha1 "github.com/kai-scheduler/KAI-scheduler/pkg/apis/kai/v1alpha1"
 	schedulingv1alpha2 "github.com/kai-scheduler/KAI-scheduler/pkg/apis/scheduling/v1alpha2"
 	schedulingv2 "github.com/kai-scheduler/KAI-scheduler/pkg/apis/scheduling/v2"
@@ -38,4 +40,5 @@ type DataLister interface {
 	ListResourceClaims() ([]*resourceapi.ResourceClaim, error)
 	ListResourceSlices() ([]*resourceapi.ResourceSlice, error)
 	ListDeviceClasses() ([]*resourceapi.DeviceClass, error)
+	ListNodeResourceTopologies() ([]*nrtapi.NodeResourceTopology, error)
 }

@@ -2338,7 +2338,7 @@ func TestNewClusterInfoErrorPartitionSelector(t *testing.T) {
 		NodePoolLabelKey:   "@!A",
 		NodePoolLabelValue: "!@#",
 	}
-	_, err := New(informerFactory, kubeAiSchedulerInformerFactory, nil, params, false, clusterPodAffinityInfo, false, true, nil, 0)
+	_, err := New(informerFactory, kubeAiSchedulerInformerFactory, nil, nil, params, false, clusterPodAffinityInfo, false, true, nil, 0)
 
 	assert.NotNil(t, err)
 }
@@ -2368,7 +2368,7 @@ func TestNewClusterInfoAddIndexerFails(t *testing.T) {
 	clusterPodAffinityInfo.EXPECT().UpdateNodeAffinity(gomock.Any()).AnyTimes()
 	clusterPodAffinityInfo.EXPECT().AddNode(gomock.Any(), gomock.Any()).AnyTimes()
 
-	_, err = New(informerFactory, kubeAiSchedulerInformerFactory, nil, nil, false,
+	_, err = New(informerFactory, kubeAiSchedulerInformerFactory, nil, nil, nil, false,
 		clusterPodAffinityInfo, false, true, nil, 0)
 	assert.NotNil(t, err, "Expected error for conflicting indexers")
 }
@@ -2406,7 +2406,7 @@ func newClusterInfoTestsInner(t *testing.T, kubeObjects, kaiSchedulerObjects []r
 	fakeUsageClient.SetResourceUsage(clusterUsage, clusterUsageErr)
 	usageLister := usagedb.NewUsageLister(&fakeUsageClient, ptr.To(10*time.Microsecond), ptr.To(10*time.Second), ptr.To(10*time.Second))
 
-	clusterInfo, _ := New(informerFactory, kubeAiSchedulerInformerFactory, usageLister, nodePoolParams, false,
+	clusterInfo, _ := New(informerFactory, kubeAiSchedulerInformerFactory, nil, usageLister, nodePoolParams, false,
 		clusterPodAffinityInfo, true, fullHierarchyFairness, nil, 0)
 
 	stopCh := context.Background().Done()

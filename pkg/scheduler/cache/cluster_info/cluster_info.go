@@ -30,6 +30,8 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/cache"
 
+	nrtinformers "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/generated/informers/externalversions"
+
 	kubeAiSchedulerinfo "github.com/kai-scheduler/KAI-scheduler/pkg/apis/client/informers/externalversions"
 	kaiv1alpha1 "github.com/kai-scheduler/KAI-scheduler/pkg/apis/kai/v1alpha1"
 	enginev2alpha2 "github.com/kai-scheduler/KAI-scheduler/pkg/apis/scheduling/v2alpha2"
@@ -79,6 +81,7 @@ const (
 func New(
 	informerFactory informers.SharedInformerFactory,
 	kubeAiSchedulerInformerFactory kubeAiSchedulerinfo.SharedInformerFactory,
+	nrtInformerFactory nrtinformers.SharedInformerFactory,
 	usageLister *usagedb.UsageLister,
 	nodePoolParams *conf.SchedulingNodePoolParams,
 	restrictNodeScheduling bool,
@@ -106,7 +109,7 @@ func New(
 	}
 
 	return &ClusterInfo{
-		dataLister:                data_lister.New(informerFactory, kubeAiSchedulerInformerFactory, usageLister, nodePoolSelector),
+		dataLister:                data_lister.New(informerFactory, kubeAiSchedulerInformerFactory, nrtInformerFactory, usageLister, nodePoolSelector),
 		nodePoolParams:            nodePoolParams,
 		restrictNodeScheduling:    restrictNodeScheduling,
 		clusterPodAffinityInfo:    clusterPodAffinityInfo,
@@ -268,7 +271,24 @@ func (c *ClusterInfo) snapshotNodes(
 	}
 
 	c.populateDRAGPUs(resultNodes)
+	c.attachNodeResourceTopologies(resultNodes)
 	return resultNodes, minGPUMemory, nil
+}
+
+// attachNodeResourceTopologies attaches the raw NRT object (matched by node
+// name) to each NodeInfo. NRT objects are cluster-scoped and named after the
+// node they describe. No-op when NRT ingestion is disabled.
+func (c *ClusterInfo) attachNodeResourceTopologies(nodes map[string]*node_info.NodeInfo) {
+	topologies, err := c.dataLister.ListNodeResourceTopologies()
+	if err != nil {
+		log.InfraLogger.V(6).Infof("Failed to list NodeResourceTopologies: %v", err)
+		return
+	}
+	for _, nrt := range topologies {
+		if nodeInfo, found := nodes[nrt.Name]; found {
+			nodeInfo.NodeResourceTopology = nrt
+		}
+	}
 }
 
 // populateDRAGPUs counts GPUs from DRA ResourceSlices for nodes that don't have extended resources.

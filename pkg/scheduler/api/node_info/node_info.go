@@ -29,6 +29,8 @@ import (
 	"golang.org/x/exp/maps"
 	v1 "k8s.io/api/core/v1"
 
+	nrtapi "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
+
 	commonconstants "github.com/kai-scheduler/KAI-scheduler/pkg/common/constants"
 	"github.com/kai-scheduler/KAI-scheduler/pkg/scheduler/api/common_info"
 	"github.com/kai-scheduler/KAI-scheduler/pkg/scheduler/api/pod_affinity"
@@ -87,6 +89,11 @@ type NodeInfo struct {
 	HasDRAGPUs bool
 
 	PodAffinityInfo pod_affinity.NodePodAffinityInfo
+
+	// NodeResourceTopology is the raw per-NUMA topology published for this node
+	// by an external NRT exporter, matched by node name. nil when the cluster
+	// has no NRT object for the node. Consumed by the numa plugin only.
+	NodeResourceTopology *nrtapi.NodeResourceTopology
 
 	GpuSharingNodeInfo
 }

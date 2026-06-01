@@ -31,6 +31,7 @@ import (
 	"github.com/kai-scheduler/KAI-scheduler/pkg/scheduler/plugins/nodeavailability"
 	"github.com/kai-scheduler/KAI-scheduler/pkg/scheduler/plugins/nodeplacement"
 	"github.com/kai-scheduler/KAI-scheduler/pkg/scheduler/plugins/nominatednode"
+	"github.com/kai-scheduler/KAI-scheduler/pkg/scheduler/plugins/numa"
 	"github.com/kai-scheduler/KAI-scheduler/pkg/scheduler/plugins/podaffinity"
 	"github.com/kai-scheduler/KAI-scheduler/pkg/scheduler/plugins/predicates"
 	"github.com/kai-scheduler/KAI-scheduler/pkg/scheduler/plugins/priority"
@@ -63,6 +64,7 @@ func InitDefaultPlugins() {
 	framework.RegisterPluginBuilder("subgrouporder", subgrouporder.New)
 	framework.RegisterPluginBuilder("dynamicresources", dynamicresources.New)
 	framework.RegisterPluginBuilder("topology", topology.New)
+	framework.RegisterPluginBuilder("numa", numa.New)
 
 	// Plugins for Queues
 	framework.RegisterPluginBuilder("proportion", proportion.New)

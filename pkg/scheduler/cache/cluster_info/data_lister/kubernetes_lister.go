@@ -18,6 +18,10 @@ import (
 	v12 "k8s.io/client-go/listers/storage/v1"
 	"k8s.io/client-go/tools/cache"
 
+	nrtapi "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
+	nrtinformers "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/generated/informers/externalversions"
+	nrtlisters "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/generated/listers/topology/v1alpha2"
+
 	kubeAiSchedulerInfo "github.com/kai-scheduler/KAI-scheduler/pkg/apis/client/informers/externalversions"
 	scheudlinglistv1alpha2 "github.com/kai-scheduler/KAI-scheduler/pkg/apis/client/listers/scheduling/v1alpha2"
 	schedlistv2 "github.com/kai-scheduler/KAI-scheduler/pkg/apis/client/listers/scheduling/v2"
@@ -57,6 +61,8 @@ type k8sLister struct {
 	resourceClaimLister resourcev1.ResourceClaimLister
 	deviceClassLister   resourcev1.DeviceClassLister
 
+	nodeResourceTopologyLister nrtlisters.NodeResourceTopologyLister
+
 	partitionSelector labels.Selector
 }
 
@@ -66,6 +72,7 @@ var _ DataLister = &k8sLister{}
 
 func New(
 	informerFactory informers.SharedInformerFactory, kubeAiSchedulerInformerFactory kubeAiSchedulerInfo.SharedInformerFactory,
+	nrtInformerFactory nrtinformers.SharedInformerFactory,
 	usageLister *usagedb.UsageLister,
 	partitionSelector labels.Selector,
 ) *k8sLister {
@@ -95,6 +102,10 @@ func New(
 		lister.resourceSliceLister = informerFactory.Resource().V1().ResourceSlices().Lister()
 		lister.resourceClaimLister = informerFactory.Resource().V1().ResourceClaims().Lister()
 		lister.deviceClassLister = informerFactory.Resource().V1().DeviceClasses().Lister()
+	}
+
+	if nrtInformerFactory != nil {
+		lister.nodeResourceTopologyLister = nrtInformerFactory.Topology().V1alpha2().NodeResourceTopologies().Lister()
 	}
 
 	return lister
@@ -237,4 +248,13 @@ func (k *k8sLister) ListDeviceClasses() ([]*resourceapi.DeviceClass, error) {
 		return nil, nil
 	}
 	return k.deviceClassLister.List(labels.Everything())
+}
+
+// +kubebuilder:rbac:groups="topology.node.k8s.io",resources=noderesourcetopologies,verbs=get;list;watch
+
+func (k *k8sLister) ListNodeResourceTopologies() ([]*nrtapi.NodeResourceTopology, error) {
+	if k.nodeResourceTopologyLister == nil {
+		return nil, nil
+	}
+	return k.nodeResourceTopologyLister.List(labels.Everything())
 }
