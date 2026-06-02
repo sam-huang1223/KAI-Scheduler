@@ -70,9 +70,11 @@ reservation ensures each successive pod sees the reduced per-zone headroom.
   it requires reproducing the kubelet's cross-provider hint merge. v1 maps `restricted` →
   `single-numa-node` (conservative — see *Policy handling*). A full design for faithful
   `restricted` is in [v2](#v2-faithful-restricted-via-reimplemented-hint-merge).
-- **Cross-cycle NRT staleness compensation.** The schedule period (1s) is far shorter than the
-  NRT refresh interval (~10–60s), so a freshly-bound pod is not reflected in NRT for many
-  cycles. v1 does not compensate for this; the in-cycle layer only guards a single cycle. An
+- **Cross-cycle NRT staleness compensation.** A freshly-bound pod is reflected in NRT only once
+  the exporter republishes. In practice that is near-real-time — both exporters push
+  **event-driven** updates on kubelet allocation changes (see *Deployment guidance*) — but it can
+  lag up to the **periodic** refresh (default 60s) if event updates are disabled or delayed. v1
+  does not compensate for any residual lag; the in-cycle layer only guards a single cycle. An
   optional design is in [Appendix A](#appendix-a-optional-cross-cycle-staleness-compensation).
 - **NUMA scoring.** Preferring nodes with tighter NUMA fit is a follow-on; v1 is filter-only.
 - **Changes to the binder / `BindRequest`.** The kubelet performs the actual NUMA pinning for
@@ -281,10 +283,15 @@ The cross-cycle staleness window (see *Known Limitations*) is an **operational**
 before it is a code concern. The recommended deployment closes it without any cross-cycle
 state in the plugin:
 
-- **Run an event-driven NRT exporter.** Prefer `resource-topology-exporter` (RTE) in its
-  event-based mode, which republishes within ~sub-second of an allocation change. Avoid
-  driving NFD's poll-only topology-updater sub-second — one NRT write per node per interval is
-  a write-storm against the API server at fleet scale; event-driven only writes on change.
+- **Keep the exporter's event-driven updates enabled (the default).** Both exporters — NFD's
+  topology-updater ([nfd-tu]) and the resource-topology-exporter (RTE, [rte]) — watch the kubelet
+  state directory (`cpu_manager_state`, `memory_manager_state`, `kubelet_internal_checkpoint`)
+  via fsnotify and republish NRT immediately on an allocation change, *in addition to* a periodic
+  refresh (`-sleep-interval`/`--sleep-interval`, default **60s**, configurable to any duration or
+  to `0` to disable periodic updates). So NRT is normally fresh within ~sub-second to a few
+  seconds of a pod start/stop. Do **not** chase freshness by driving the *periodic* interval very
+  low — that is a per-node-per-interval write storm at fleet scale; the **event** path is what
+  delivers freshness. (RTE rate-limits event scans via `--max-events-per-second`, default 1.)
 - **Raise `--schedule-period`** (default `1s`) to, e.g., `5s`. This gives the full
   bind → kubelet-admit → exporter → apiserver → informer pipeline time to reflect a binding
   before the next cycle, so prior binds are visible and the hot-loop does not form. Note this
@@ -310,11 +317,20 @@ regardless; Appendix A is the in-plugin fallback if the assumption proves insuff
 - **Greedy container-scope packing** is order-sensitive and an approximation of the kubelet's
   per-container hint merge. Exact in the common single-GPU-container case.
 - **Cross-cycle staleness is not compensated in code in v1.** Between binding a NUMA pod and the
-  next NRT refresh, the scheduler may re-pick the same node off stale `Available`; under packing
-  pressure this can produce a bounded reschedule hot-loop until NRT catches up. The kubelet
-  still preserves correctness. The recommended mitigation is operational (event-driven exporter
-  + longer `--schedule-period`, see *Deployment guidance*);
+  exporter republishing NRT (near-real-time when event-driven updates are active, else up to the
+  periodic refresh, default ~60s), the scheduler may re-pick the same node off stale `Available`;
+  under packing pressure this can produce a bounded reschedule hot-loop until NRT catches up. The
+  kubelet still preserves correctness. The recommended mitigation is operational (keep
+  event-driven updates on + optionally a longer `--schedule-period`, see *Deployment guidance*);
   [Appendix A](#appendix-a-optional-cross-cycle-staleness-compensation) is the in-plugin fallback.
+- **Reclaim-simulation accuracy.** The scheduler never observes a pod's *actual* NUMA zone (NRT
+  is aggregate per-zone only); it predicts it. So reclaim/preemption of NUMA pods is simulated
+  on predicted victim zones and can occasionally waste an eviction when the pending pod needs
+  multiple per-zone-scarce resources co-located (GPU-bound pods with abundant per-zone CPU are
+  largely immune). **Until the optional [per-node NUMA placement agent](../numa-placement-agent/README.md)
+  is implemented (Appendix B), reclaim predictions are not accurate** — they rely on
+  prediction + the kubelet backstop. The worst case is a wasted eviction and a bounce, never a
+  loop.
 - **`restricted` is over-strict** by design (mapped to `single-numa-node`).
 
 ## Testing
@@ -411,6 +427,27 @@ unstable kubelet internals across versions; notably, upstream scheduler-plugins 
 `bitmask` and reimplements the rest. v2 follows that lead and reimplements the merge over the
 plugin's per-zone model.
 
+### Prior art: how others handle `restricted`
+
+- **kubernetes-sigs/scheduler-plugins (NodeResourceTopology):** its Filter enforces only
+  `single-numa-node`; for `restricted`/`best-effort` it passes through, leaving `restricted` to
+  the kubelet. Its Score's per-zone strategies are likewise `single-numa-node`-only — a separate,
+  policy-agnostic `LeastNUMANodes` strategy merely ranks nodes by NUMA span and is not
+  `restricted`-specific. So it does **not** pre-compute the `restricted` verdict.
+- **Volcano (`numa-aware` plugin):** *does* pre-compute `restricted` distinctly — it reads each
+  node's Topology Manager policy from its own `Numatopology` CRD (published by a Volcano node
+  agent), instantiates a dedicated restricted policy, runs a kubelet-style hint merge, and
+  rejects the node when the best merged hint is not `Preferred`. Two caveats relevant to KAI: it
+  reasons over **CPU hints only** (no GPU/device hint provider), and its merge is a *simplified*
+  variant of the kubelet's (it drops the "all affinities equal" preferred rule and the
+  `bestNonPreferredAffinityCount` tie-break), so its verdict can diverge from the real kubelet.
+
+This validates v2's direction — reimplement the merge (the kubelet packages are not cleanly
+importable) — while highlighting the gap KAI targets: **GPU/device** NUMA alignment, which
+Volcano's CPU-only plugin does not cover. Volcano's per-pod placement tracking (`assignRes`) plus
+its node agent is also close prior art for the
+[placement agent](../numa-placement-agent/README.md).
+
 ### Implementation
 
 - A `resourceHinter` registry (the "mini-plugin" mechanism): per allowlisted resource,
@@ -449,51 +486,113 @@ backstop) — only scheduling efficiency during the NRT refresh window.
 
 ### The problem
 
-The schedule period is **1s** (`defaultSchedulerPeriod`) but NRT is refreshed by an external
-exporter every **~10–60s**. So for many cycles after binding a NUMA pod, NRT `Available` still
-shows the pre-binding state. A second NUMA pod can then be placed on the same node off stale
-data; under packing pressure the kubelet rejects it (`TopologyAffinityError`), and since the
-next cycle sees the same stale NRT the scheduler re-picks the same node — a hot-loop until NRT
-catches up.
+The schedule period is **1s** (`defaultSchedulerPeriod`). NRT is republished by the exporter
+near-real-time on allocation changes (event-driven), but can lag up to its **periodic** refresh
+(default 60s, configurable; see *Deployment guidance*) if event updates are disabled or delayed.
+During any such lag, NRT `Available` still shows the pre-binding state: a second NUMA pod can be
+placed on the same node off stale data; under packing pressure the kubelet rejects it
+(`TopologyAffinityError`), and since the next cycle sees the same stale NRT the scheduler
+re-picks the same node — a hot-loop until NRT catches up. With event-driven updates active this
+window is small; this appendix matters only when it is not.
 
-### Two tempting approaches that don't work
+### The clean signal: the NRT pod fingerprint
 
-- **A persistent cache of bound pods evicted on NRT-generation advance / TTL.** The eviction
-  is a guess — there is no clean "is this pod now in `Available`?" signal. Flush too early →
-  under-reserve → over-place; flush too late → double-count → false rejects.
-- **Stateless replay** (recompute per-zone occupancy each cycle by predicting every aligned
-  pod's zone against static capacity, optionally clamped with `min(NRT.Available, …)`). This
-  **drifts permanently**: the scheduler's predicted per-zone split rarely matches the kubelet's
-  actual (history-dependent) packing, the prediction is re-derived identically every cycle
-  (a restart does not help), and `min()` discards a *correct* `Available` whenever the
-  prediction is more pessimistic — permanently stranding capacity under fragmentation.
+The hard part of any cross-cycle cache is *eviction* — knowing when NRT has caught up so the
+cache can stop compensating. There is a deterministic signal for this: the **pod fingerprint**
+([`podfingerprint`](https://github.com/k8stopologyawareschedwg/podfingerprint)). The exporter
+hashes the set of pods (by `namespace+name`) whose resources it accounted for when building the
+NRT object and publishes it on the object:
 
-Both fail the same way: they let prediction become **permanent** instead of **transient**. NRT
-`Available` (once refreshed) is ground truth; prediction should only ever bridge its lag and
-then defer back to it.
+- attribute **`nodeTopologyPodsFingerprint`**, with **`nodeTopologyPodsFingerprintMethod`** =
+  `all` or `with-exclusive-resources` (legacy annotation `topology.node.k8s.io/fingerprint`).
 
-### Gap-bounded correction
+It lets the scheduler answer *"does this NRT object already reflect the pods I know about?"*
+exactly:
 
-Anchor on NRT `Available`, and correct only the measured lag, bounded so it auto-decays:
+1. List the pods the scheduler sees on the node (it already exposes its own just-bound pods to
+   the next snapshot). Use the **`with-exclusive-resources`** subset to match the exporter's
+   method — that subset is exactly our Guaranteed whole-GPU pods.
+2. Compute their fingerprint and compare to the NRT object's `nodeTopologyPodsFingerprint`.
+3. **Match** → NRT accounts for exactly that pod set → it is current → trust `Available`.
+   **Mismatch** → a pod the scheduler knows (e.g. a just-bound one) is not yet reflected → do
+   not trust `Available` for this node.
 
-```
-for each tracked resource (primarily nvidia.com/gpu):
-    gap = Σ_zone NRT.Available[zone]  −  KAI_exact_node_free
-```
+This is the mechanism upstream's production NRT cache uses (`OverReserve.Resync`).
 
-`KAI_exact_node_free` comes from the existing whole-node accounting (`IdleVector` =
-allocatable − pods actually on the node); it never lags.
+### Serving a dirty node: never skip — reconstruct
 
-- `gap > 0` → NRT over-reports by `gap` (recent binds not yet absorbed). Subtract up to `gap`
-  worth from the predicted zones of a small **recent-bind list** (newest first), then stop.
-- `gap == 0` → NRT is caught up → **no correction; use `Available` verbatim** (ground truth).
-- `gap < 0` → NRT already sees consumption KAI doesn't (e.g. a non-aligned Burstable GPU pod) →
-  NRT is the more conservative, correct view → use as-is.
+A first instinct is to **skip** a dirty node (fail the NUMA predicate on it until it goes
+clean). Do **not**: it breaks multi-cycle reclaim. A reclaim/preempt decision spans cycles —
+victims drain over their `terminationGracePeriod` while the pending pod is *pipelined* onto the
+node. If the node disappears from NUMA consideration mid-drain, the solver re-plans onto a
+different node and **evicts a second set of victims** while the first set is already dying.
+Staleness would thus actively *multiply* evictions. The node must stay a candidate.
 
-Because the correction is capped by the real, self-measured lag, a mispredicted zone is wrong
-only *during* the refresh window and then evaporates as `gap → 0` — no permanent drift. The
-recent-bind list (populated on actual **bind**, never on speculative `AllocateFunc`) only
-*places* the capped correction; it is not correctness-load-bearing for eviction, so entries can
-be pruned loosely (on `gap == 0`, pod deletion, or a TTL) purely for memory hygiene.
+So a dirty node is served a **reconstructed** view rather than being dropped:
+
+- **Clean node (fingerprint match):** use NRT `Available` directly — ground truth, already
+  reflecting *every* pod on the node (ours or not). No prediction.
+- **Dirty node (mismatch):** reconstruct per-zone availability from the snapshot,
+  `available[zone] = capacity[zone] − Σ predicted_occupancy[zone]` over **all** NUMA pods on the
+  node (`capacity` = static per-zone NRT `Allocatable`; each pod assigned a predicted zone via
+  the evaluator). Used only while dirty; the next match reverts to NRT.
+
+The fingerprint gate is what makes reconstruction safe: it is **transient**, so it cannot drift
+permanently the way an *ungated* reconstruction would (one that never defers to ground truth and
+strands capacity under fragmentation).
+
+**No foreign-pod special case.** Upstream rejects nodes carrying pods it did not schedule,
+because its cache is built only from its own `Reserve` calls and has no record of a foreign pod
+to subtract. KAI's snapshot already contains *every* pod on the node (it must, for whole-node
+`IdleVector`), and no pod's zone is ever *observed* anyway — ours included, all zones are
+predictions. So reconstruction treats foreign and self-scheduled pods identically; there is
+nothing special about a pod we did not place.
+
+**Eviction credits the freed zone.** Because reconstruction assigns every live NUMA pod a
+predicted zone, the in-cycle `DeallocateFunc` credits a victim's zone back when a reclaim
+scenario (speculatively) evicts it — so NUMA-pod reclaim scenarios succeed without re-planning.
+The prediction need only be **internally consistent**, not match the kubelet: a wrong victim
+zone just means the pending pod is pipelined onto a zone label differing from where the kubelet
+actually frees a GPU — but a GPU *did* free, so the kubelet still admits it. Mispredicted zones
+cost internal precision, never correctness. The optional
+[per-node NUMA placement agent](../numa-placement-agent/README.md) (Appendix B) removes the
+prediction entirely by reporting each pod's *observed* zone, making reclaim simulation exact.
+
+### Caveats and the no-fingerprint fallback
+
+- **Requires a fingerprint-emitting exporter** (RTE publishes it; plain NFD topology-updater may
+  not). No attribute → no clean/dirty signal → fall back to the operational mitigation, or the
+  gap-bounded correction below.
+- **v1 fingerprint is `namespace+name`, not UID** — aliases only if *naked* pods are recreated
+  with the same name under churn; a non-issue with controllers (unique generated names).
+- **Transient over-report during a dirty window.** Reconstruction predicts zones, so it can
+  briefly over-report a zone and earn a kubelet rejection — bounded to the window and caught by
+  the kubelet backstop. This is the accepted cost of keeping the node usable (vs. skip) for
+  reclaim stability.
+- **No fingerprint? Gap-bounded fallback.** Without the clean/dirty gate, anchor on NRT
+  `Available` and subtract only up to the measured lag `gap = Σ_zone Available −
+  KAI_exact_node_free` (KAI's whole-node free never lags); it auto-decays as NRT catches up.
+  The drift warning applies specifically to *ungated* reconstruction — with no fingerprint to
+  snap back to NRT, predicting all pods' zones every cycle never defers to ground truth.
+
+## Appendix B: (optional) per-node NUMA placement agent
+
+**Status: optional, not part of v1.** Full design:
+[Per-Node NUMA Placement Agent](../numa-placement-agent/README.md).
+
+The scheduler never observes a pod's actual NUMA zone — NRT is aggregate per-zone only — so the
+plugin *predicts* placement. Prediction is fine for filtering (the kubelet backstops admission)
+but makes reclaim simulation inexact: **until this agent exists, reclaim predictions for NUMA
+pods are not accurate** (they rely on predicted victim zones + the kubelet backstop; worst case
+is a wasted eviction, see *Reclaim-simulation accuracy* in Known Limitations).
+
+The agent is a per-node DaemonSet that reads the kubelet **podresources API**, derives each
+pod's actual per-zone resource placement, and publishes it as a pod annotation
+(`kai.scheduler/numa-placement`). When present, the plugin uses *observed* placement instead of
+predicting it: per-zone occupancy becomes exact, victim evictions credit the real zone, and
+reclaim simulation is accurate. When absent, the plugin falls back to prediction — so the agent
+is purely additive and can be enabled independently, after v1.
 
 [nrt-api]: https://github.com/k8stopologyawareschedwg/noderesourcetopology-api
+[nfd-tu]: https://github.com/kubernetes-sigs/node-feature-discovery/blob/master/pkg/nfd-topology-updater/kubeletnotifier/kubeletnotifier.go
+[rte]: https://github.com/k8stopologyawareschedwg/resource-topology-exporter/blob/main/pkg/notification/notification.go
