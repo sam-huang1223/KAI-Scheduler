@@ -51,11 +51,15 @@ const (
 	numaNodeZoneType = "Node"
 )
 
-// numaZone is one NUMA node's working headroom, seeded from NRT zone Available
-// and decremented as tasks commit in-cycle, restored on rollback/eviction.
+// numaZone is one NUMA node's working state. available is seeded from NRT zone
+// Available and decremented as tasks commit in-cycle (restored on rollback);
+// capacity is the fixed per-zone total. The `restricted` evaluator needs both:
+// feasibility is judged against available, but the minimal NUMA-node width that
+// makes a hint "preferred" is derived from capacity (matching the kubelet).
 type numaZone struct {
 	id        string
 	available map[v1.ResourceName]resource.Quantity
+	capacity  map[v1.ResourceName]resource.Quantity
 }
 
 func (z *numaZone) clone() *numaZone {
@@ -63,7 +67,8 @@ func (z *numaZone) clone() *numaZone {
 	for name, qty := range z.available {
 		available[name] = qty.DeepCopy()
 	}
-	return &numaZone{id: z.id, available: available}
+	// capacity is read-only; share the map to avoid copying every clone.
+	return &numaZone{id: z.id, available: available, capacity: z.capacity}
 }
 
 // nodeTopology is the plugin's per-node working state, rebuilt each session.
@@ -83,7 +88,11 @@ func cloneZones(zones []*numaZone) []*numaZone {
 }
 
 func (nt *nodeTopology) zoneByID(id string) *numaZone {
-	for _, z := range nt.zones {
+	return zoneByID(nt.zones, id)
+}
+
+func zoneByID(zones []*numaZone, id string) *numaZone {
+	for _, z := range zones {
 		if z.id == id {
 			return z
 		}
@@ -104,15 +113,17 @@ func buildNodeTopology(nrt *nrtapi.NodeResourceTopology, allowlist sets.Set[v1.R
 			continue
 		}
 		available := map[v1.ResourceName]resource.Quantity{}
+		capacity := map[v1.ResourceName]resource.Quantity{}
 		for _, ri := range zone.Resources {
 			name := v1.ResourceName(ri.Name)
 			if !allowlist.Has(name) {
 				continue
 			}
 			available[name] = ri.Available.DeepCopy()
+			capacity[name] = ri.Capacity.DeepCopy()
 			topologyAware.Insert(name)
 		}
-		zones = append(zones, &numaZone{id: zone.Name, available: available})
+		zones = append(zones, &numaZone{id: zone.Name, available: available, capacity: capacity})
 	}
 
 	return &nodeTopology{
@@ -145,6 +156,8 @@ func parsePolicyValue(value string) tmPolicy {
 		return policyRestricted
 	case policyValueBestEffort:
 		return policyBestEffort
+	case policyValueNone:
+		return policyNone
 	default:
 		return policyNone
 	}

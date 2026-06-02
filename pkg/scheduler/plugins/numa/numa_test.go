@@ -96,13 +96,35 @@ func twoContainerGPUPod() *pod_info.PodInfo {
 	}
 }
 
+// zoneAC builds a zone with explicit available and capacity quantities.
+func zoneAC(id string, available, capacity map[v1.ResourceName]string) *numaZone {
+	a := map[v1.ResourceName]resource.Quantity{}
+	c := map[v1.ResourceName]resource.Quantity{}
+	for name, v := range available {
+		a[name] = resource.MustParse(v)
+	}
+	for name, v := range capacity {
+		c[name] = resource.MustParse(v)
+	}
+	return &numaZone{id: id, available: a, capacity: c}
+}
+
+func zoneIDs(zones []*numaZone) []string {
+	ids := make([]string, 0, len(zones))
+	for _, z := range zones {
+		ids = append(ids, z.id)
+	}
+	return ids
+}
+
 func defaultPlugin() *numaPlugin {
 	return &numaPlugin{
-		allowlist:             defaultAllowlist(),
-		evaluator:             singleNUMAEvaluator{},
-		mapRestrictedToSingle: true,
-		nodes:                 map[string]*nodeTopology{},
-		reserved:              map[common_info.PodID][]zoneCharge{},
+		allowlist:      defaultAllowlist(),
+		single:         singleNUMAEvaluator{},
+		restricted:     restrictedEvaluator{},
+		restrictedMode: restrictedConservative,
+		nodes:          map[string]*nodeTopology{},
+		reserved:       map[common_info.PodID][]zoneCharge{},
 	}
 }
 
@@ -191,47 +213,61 @@ var _ = Describe("shouldHandle", func() {
 	var np *numaPlugin
 	var single *nodeTopology
 
+	handles := func(p *numaPlugin, task *pod_info.PodInfo, nt *nodeTopology) bool {
+		_, ok := p.shouldHandle(task, nt)
+		return ok
+	}
+
 	BeforeEach(func() {
 		np = defaultPlugin()
 		single = &nodeTopology{policy: policySingleNUMANode, scope: scopeContainer}
 	})
 
 	It("handles a Guaranteed whole-GPU pod on a single-numa-node node", func() {
-		Expect(np.shouldHandle(guaranteedGPUPod("1", "4", "8Gi"), single)).To(BeTrue())
+		Expect(handles(np, guaranteedGPUPod("1", "4", "8Gi"), single)).To(BeTrue())
 	})
 
 	It("passes through when there is no topology for the node", func() {
-		Expect(np.shouldHandle(guaranteedGPUPod("1", "4", "8Gi"), nil)).To(BeFalse())
+		Expect(handles(np, guaranteedGPUPod("1", "4", "8Gi"), nil)).To(BeFalse())
 	})
 
 	It("passes through best-effort / none nodes", func() {
-		Expect(np.shouldHandle(guaranteedGPUPod("1", "4", "8Gi"), &nodeTopology{policy: policyBestEffort})).To(BeFalse())
-		Expect(np.shouldHandle(guaranteedGPUPod("1", "4", "8Gi"), &nodeTopology{policy: policyNone})).To(BeFalse())
+		Expect(handles(np, guaranteedGPUPod("1", "4", "8Gi"), &nodeTopology{policy: policyBestEffort})).To(BeFalse())
+		Expect(handles(np, guaranteedGPUPod("1", "4", "8Gi"), &nodeTopology{policy: policyNone})).To(BeFalse())
 	})
 
 	It("maps restricted to single-numa-node conservatively by default", func() {
-		Expect(np.shouldHandle(guaranteedGPUPod("1", "4", "8Gi"), &nodeTopology{policy: policyRestricted})).To(BeTrue())
+		eval, ok := np.shouldHandle(guaranteedGPUPod("1", "4", "8Gi"), &nodeTopology{policy: policyRestricted})
+		Expect(ok).To(BeTrue())
+		Expect(eval).To(BeAssignableToTypeOf(singleNUMAEvaluator{}))
 	})
 
-	It("skips restricted nodes when conservative mapping is disabled", func() {
-		np.mapRestrictedToSingle = false
-		Expect(np.shouldHandle(guaranteedGPUPod("1", "4", "8Gi"), &nodeTopology{policy: policyRestricted})).To(BeFalse())
+	It("uses the faithful evaluator for restricted nodes in faithful mode", func() {
+		np.restrictedMode = restrictedFaithful
+		eval, ok := np.shouldHandle(guaranteedGPUPod("1", "4", "8Gi"), &nodeTopology{policy: policyRestricted})
+		Expect(ok).To(BeTrue())
+		Expect(eval).To(BeAssignableToTypeOf(restrictedEvaluator{}))
+	})
+
+	It("skips restricted nodes in skip mode", func() {
+		np.restrictedMode = restrictedSkip
+		Expect(handles(np, guaranteedGPUPod("1", "4", "8Gi"), &nodeTopology{policy: policyRestricted})).To(BeFalse())
 	})
 
 	It("passes through non-Guaranteed pods", func() {
 		pod := guaranteedGPUPod("1", "4", "8Gi")
 		pod.Pod.Status.QOSClass = v1.PodQOSBurstable
-		Expect(np.shouldHandle(pod, single)).To(BeFalse())
+		Expect(handles(np, pod, single)).To(BeFalse())
 	})
 
 	It("passes through fractional and MIG GPU requests", func() {
 		frac := guaranteedGPUPod("1", "4", "8Gi")
 		frac.ResourceRequestType = pod_info.RequestTypeFraction
-		Expect(np.shouldHandle(frac, single)).To(BeFalse())
+		Expect(handles(np, frac, single)).To(BeFalse())
 
 		mig := guaranteedGPUPod("1", "4", "8Gi")
 		mig.ResourceRequestType = pod_info.RequestTypeMigInstance
-		Expect(np.shouldHandle(mig, single)).To(BeFalse())
+		Expect(handles(np, mig, single)).To(BeFalse())
 	})
 })
 
@@ -331,5 +367,168 @@ var _ = Describe("in-cycle reservation", func() {
 		// Rolling back the first pod frees the zone for the second.
 		np.deallocate(&framework.Event{Task: first})
 		Expect(np.predicateFn(second, nil, node)).To(Succeed())
+	})
+})
+
+// --- faithful restricted evaluator ---
+
+var _ = Describe("restrictedEvaluator", func() {
+	eval := restrictedEvaluator{}
+
+	It("admits a cpu request that must span both zones; single-numa-node rejects it", func() {
+		// Per-zone cpu capacity 96, free 95/96. Request 120 needs 2 zones.
+		zones := []*numaZone{
+			zoneAC("node-0", map[v1.ResourceName]string{v1.ResourceCPU: "95"}, map[v1.ResourceName]string{v1.ResourceCPU: "96"}),
+			zoneAC("node-1", map[v1.ResourceName]string{v1.ResourceCPU: "96"}, map[v1.ResourceName]string{v1.ResourceCPU: "96"}),
+		}
+		aware := sets.New(v1.ResourceCPU)
+		req := resourceRequests{v1.ResourceCPU: resource.MustParse("120")}
+
+		_, ok := singleNUMAEvaluator{}.evaluate(zones, aware, req, v1.PodQOSGuaranteed)
+		Expect(ok).To(BeFalse(), "single-numa-node cannot fit 120 in one 96-cpu zone")
+
+		got, ok := eval.evaluate(zones, aware, req, v1.PodQOSGuaranteed)
+		Expect(ok).To(BeTrue())
+		Expect(zoneIDs(got)).To(ConsistOf("node-0", "node-1"))
+	})
+
+	It("rejects the fragmentation footgun: fits one zone's capacity but not its free cpus", func() {
+		// Capacity 96/zone (minimal width 1), but free 45/46 -> the only feasible span
+		// is 2 zones, which is wider than minimal -> not preferred -> reject.
+		zones := []*numaZone{
+			zoneAC("node-0", map[v1.ResourceName]string{v1.ResourceCPU: "45"}, map[v1.ResourceName]string{v1.ResourceCPU: "96"}),
+			zoneAC("node-1", map[v1.ResourceName]string{v1.ResourceCPU: "46"}, map[v1.ResourceName]string{v1.ResourceCPU: "96"}),
+		}
+		_, ok := eval.evaluate(zones, sets.New(v1.ResourceCPU), resourceRequests{v1.ResourceCPU: resource.MustParse("80")}, v1.PodQOSGuaranteed)
+		Expect(ok).To(BeFalse())
+	})
+
+	It("rejects when resources disagree on minimal width (4 GPU needs 2 nodes, 1 CPU needs 1)", func() {
+		zones := []*numaZone{
+			zoneAC("node-0", map[v1.ResourceName]string{resourceGPU: "2", v1.ResourceCPU: "100"}, map[v1.ResourceName]string{resourceGPU: "2", v1.ResourceCPU: "100"}),
+			zoneAC("node-1", map[v1.ResourceName]string{resourceGPU: "2", v1.ResourceCPU: "100"}, map[v1.ResourceName]string{resourceGPU: "2", v1.ResourceCPU: "100"}),
+		}
+		aware := sets.New(resourceGPU, v1.ResourceCPU)
+		req := resourceRequests{resourceGPU: resource.MustParse("4"), v1.ResourceCPU: resource.MustParse("1")}
+		_, ok := eval.evaluate(zones, aware, req, v1.PodQOSGuaranteed)
+		Expect(ok).To(BeFalse())
+	})
+
+	It("admits a large balanced pod where every resource needs the same 2-node mask", func() {
+		zones := []*numaZone{
+			zoneAC("node-0", map[v1.ResourceName]string{resourceGPU: "4", v1.ResourceCPU: "16"}, map[v1.ResourceName]string{resourceGPU: "4", v1.ResourceCPU: "16"}),
+			zoneAC("node-1", map[v1.ResourceName]string{resourceGPU: "4", v1.ResourceCPU: "16"}, map[v1.ResourceName]string{resourceGPU: "4", v1.ResourceCPU: "16"}),
+		}
+		aware := sets.New(resourceGPU, v1.ResourceCPU)
+		req := resourceRequests{resourceGPU: resource.MustParse("6"), v1.ResourceCPU: resource.MustParse("24")}
+		got, ok := eval.evaluate(zones, aware, req, v1.PodQOSGuaranteed)
+		Expect(ok).To(BeTrue())
+		Expect(zoneIDs(got)).To(ConsistOf("node-0", "node-1"))
+	})
+
+	It("places a small pod on a single zone (|M|=1 special case)", func() {
+		zones := []*numaZone{
+			zoneAC("node-0", map[v1.ResourceName]string{resourceGPU: "4", v1.ResourceCPU: "16"}, map[v1.ResourceName]string{resourceGPU: "4", v1.ResourceCPU: "16"}),
+			zoneAC("node-1", map[v1.ResourceName]string{resourceGPU: "4", v1.ResourceCPU: "16"}, map[v1.ResourceName]string{resourceGPU: "4", v1.ResourceCPU: "16"}),
+		}
+		got, ok := eval.evaluate(zones, sets.New(resourceGPU, v1.ResourceCPU),
+			resourceRequests{resourceGPU: resource.MustParse("1"), v1.ResourceCPU: resource.MustParse("2")}, v1.PodQOSGuaranteed)
+		Expect(ok).To(BeTrue())
+		Expect(got).To(HaveLen(1))
+		Expect(got[0].id).To(Equal("node-0"))
+	})
+})
+
+var _ = Describe("faithful restricted: predicate and reservation", func() {
+	node := &node_info.NodeInfo{Name: "node-a"}
+
+	cpuOnlyNRT := func() *nrtapi.NodeResourceTopology {
+		nrt := newNRT(policyValueRestricted, scopeValuePod,
+			zone("node-0", map[v1.ResourceName]string{v1.ResourceCPU: "95"}),
+			zone("node-1", map[v1.ResourceName]string{v1.ResourceCPU: "96"}),
+		)
+		// zone() sets available==capacity from a single value; force capacity 96.
+		for i := range nrt.Zones {
+			for j := range nrt.Zones[i].Resources {
+				nrt.Zones[i].Resources[j].Capacity = resource.MustParse("96")
+			}
+		}
+		return nrt
+	}
+
+	cpuPod := func(cpu string) *pod_info.PodInfo {
+		p := guaranteedGPUPod("0", cpu, "1Gi")
+		delete(p.Pod.Spec.Containers[0].Resources.Requests, resourceGPU)
+		delete(p.Pod.Spec.Containers[0].Resources.Limits, resourceGPU)
+		return p
+	}
+
+	It("conservative mode rejects the multi-NUMA cpu pod (over-strict)", func() {
+		np := defaultPlugin() // conservative
+		np.nodes["node-a"] = buildNodeTopology(cpuOnlyNRT(), np.allowlist)
+		Expect(np.predicateFn(cpuPod("120"), nil, node)).To(HaveOccurred())
+	})
+
+	It("faithful mode admits it and splits the reservation across both zones", func() {
+		np := defaultPlugin()
+		np.restrictedMode = restrictedFaithful
+		np.nodes["node-a"] = buildNodeTopology(cpuOnlyNRT(), np.allowlist)
+		nt := np.nodes["node-a"]
+
+		task := cpuPod("120")
+		Expect(np.predicateFn(task, nil, node)).To(Succeed())
+
+		np.allocate(&framework.Event{Task: task})
+		// 120 split greedily: node-0 filled to its 95 free, node-1 takes the rest (25).
+		n0 := nt.zoneByID("node-0").available[v1.ResourceCPU]
+		n1 := nt.zoneByID("node-1").available[v1.ResourceCPU]
+		Expect(n0.Value()).To(Equal(int64(0)))
+		Expect(n1.Value()).To(Equal(int64(71)))
+
+		np.deallocate(&framework.Event{Task: task})
+		n0 = nt.zoneByID("node-0").available[v1.ResourceCPU]
+		n1 = nt.zoneByID("node-1").available[v1.ResourceCPU]
+		Expect(n0.Value()).To(Equal(int64(95)))
+		Expect(n1.Value()).To(Equal(int64(96)))
+	})
+})
+
+var _ = Describe("parseRestrictedMode", func() {
+	It("parses known modes and defaults empty to conservative", func() {
+		for in, want := range map[string]restrictedMode{
+			"":             restrictedConservative,
+			"conservative": restrictedConservative,
+			"faithful":     restrictedFaithful,
+			"skip":         restrictedSkip,
+			"FAITHFUL":     restrictedFaithful,
+		} {
+			got, ok := parseRestrictedMode(in)
+			Expect(ok).To(BeTrue(), "input %q", in)
+			Expect(got).To(Equal(want), "input %q", in)
+		}
+	})
+
+	It("flags an unrecognized mode and falls back to conservative", func() {
+		got, ok := parseRestrictedMode("bogus")
+		Expect(ok).To(BeFalse())
+		Expect(got).To(Equal(restrictedConservative))
+	})
+})
+
+var _ = Describe("buildNodeTopology capacity", func() {
+	It("records per-zone capacity distinct from available", func() {
+		nrt := newNRT(policyValueRestricted, scopeValuePod, zone("node-0", nil))
+		nrt.Zones[0].Resources = nrtapi.ResourceInfoList{{
+			Name:        string(v1.ResourceCPU),
+			Available:   resource.MustParse("40"),
+			Allocatable: resource.MustParse("95"),
+			Capacity:    resource.MustParse("96"),
+		}}
+		nt := buildNodeTopology(nrt, defaultAllowlist())
+		z := nt.zoneByID("node-0")
+		avail := z.available[v1.ResourceCPU]
+		capn := z.capacity[v1.ResourceCPU]
+		Expect(avail.Value()).To(Equal(int64(40)))
+		Expect(capn.Value()).To(Equal(int64(96)))
 	})
 })

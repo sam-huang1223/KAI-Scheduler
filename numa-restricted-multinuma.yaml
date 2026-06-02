@@ -1,0 +1,66 @@
+# Copyright 2026 NVIDIA CORPORATION
+# SPDX-License-Identifier: Apache-2.0
+
+# Demo: a pod the kubelet ADMITS under `restricted` but REJECTS under `single-numa-node`.
+#
+# Node:  2 NUMA zones, cpu capacity 96 each, ~191 cpu allocatable total (see nrt.yaml).
+#        cpu is the only topology-aware resource reported per zone.
+# Requires CPU Manager static policy (the NRT/Guaranteed setup implies it).
+#
+# The pod is Guaranteed QoS (requests==limits, integer cpu) so it engages the
+# CPU Manager + Topology Manager. It requests 120 cpu:
+#
+#   * 120 > 96  -> it cannot fit in a SINGLE NUMA zone.
+#   * 120 <= 191 -> it fits across the TWO zones combined.
+#
+# How each kubelet policy decides (see README "How the kubelet decides"):
+#   single-numa-node: demands all aligned resources on ONE zone. No zone has 120 cpu
+#                     -> no satisfying hint -> admission REJECTED (TopologyAffinityError).
+#   restricted:       admits iff the best merged hint is Preferred (== minimal NUMA-node
+#                     width). cpu's minimal width is ceil(120/96)=2, so the ONLY preferred
+#                     hint is the 2-zone mask {node-0,node-1}. cpu is the only topology-aware
+#                     resource, so that mask IS the merged best hint and it is preferred
+#                     -> ADMITTED, spanning both NUMA nodes.
+#
+# This is exactly the v2 "large, balanced" case: restricted unlocks a genuinely
+# multi-NUMA pod that single-numa-node would reject.
+#
+# NOTE on the KAI numa plugin: its `restrictedMode` argument controls this case.
+#   * "conservative" (default): maps `restricted` -> `single-numa-node`, so KAI FILTERS this
+#     pod off the node (stricter than the kubelet, but never causes a TopologyAffinityError).
+#   * "faithful": reproduces the kubelet's `restricted` decision; KAI admits this pod on the
+#     {node-0,node-1} span, matching the kubelet.
+#   * "skip": leaves `restricted` nodes unconstrained (kubelet is the sole arbiter).
+# To see KAI bind this pod, set:
+#   scheduler.plugins.numa.arguments.restrictedMode: "faithful"
+#
+# Try it:
+#   # node currently has policy=restricted (nrt.yaml) -> expect Running
+#   kubectl apply -f numa-restricted-multinuma.yaml
+#   kubectl get pod numa-multinuma -w
+#
+#   # flip the node's kubelet to topologyManagerPolicy=single-numa-node and re-apply
+#   # -> expect Failed with reason: TopologyAffinityError
+#   kubectl describe pod numa-multinuma | grep -i topology
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: numa-multinuma
+  labels:
+    kai.scheduler/queue: default-queue
+    demo: numa-restricted-multinuma
+spec:
+  schedulerName: kai-scheduler
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: main
+      image: ubuntu
+      args: ["sleep", "infinity"]
+      resources:
+        requests:
+          cpu: "120"
+          memory: 1Gi
+        limits:
+          cpu: "120"
+          memory: 1Gi
