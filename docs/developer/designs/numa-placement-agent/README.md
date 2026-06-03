@@ -74,9 +74,13 @@ A DaemonSet on each NUMA/GPU node. Each instance:
 A single annotation on the pod, resource → {NUMA node → quantity}:
 
 ```
-kai.scheduler/numa-placement: |
+kai.scheduler/numa-placement-observed: |
   {"nvidia.com/gpu":{"0":2},"cpu":{"0":8},"memory":{"0":17179869184}}
 ```
+
+The `-observed` suffix distinguishes this agent's *measured* placement from the scheduler's own
+`kai.scheduler/numa-placement-predicted` record (see the plugin design); both share the same
+value format.
 
 This represents multi-zone placement too (a `restricted`/multi-NUMA pod would list more than
 one node), so it is not specific to `single-numa-node`.
@@ -85,12 +89,20 @@ one node), so it is not specific to `single-numa-node`.
 
 The NUMA plugin, when building its per-zone model:
 
-- **If a pod carries `kai.scheduler/numa-placement`** → use the observed per-zone quantities
-  directly. Occupancy is now *exact*, not predicted: per-zone availability can be reconstructed
-  as `capacity[zone] − Σ observed_placement[zone]`, and a victim's eviction credits the *real*
-  zone. Reclaim simulation becomes accurate.
-- **If a pod lacks the annotation** (agent absent, pod not yet observed, or non-aligned) → fall
-  back to the prediction path described in the plugin design.
+Precedence is **observed > predicted > re-derive**:
+
+- **If a pod carries `kai.scheduler/numa-placement-observed`** → use the observed per-zone
+  quantities directly; this **supersedes** any scheduler-predicted record. Occupancy is now
+  *exact*, not predicted: per-zone availability can be reconstructed as
+  `capacity[zone] − Σ observed_placement[zone]`, and a victim's eviction credits the *real* zone.
+  Reclaim simulation becomes accurate.
+- **Else if the pod carries the scheduler's `…-predicted` record** → use that (stable, but a
+  prediction — see the plugin design).
+- **Else** (agent absent, pod not yet observed, non-aligned, and no predicted record) → re-derive
+  via the evaluator.
+
+When both records are present, their agreement is the prediction-accuracy signal described in
+the plugin design.
 
 No new informer or CRD is needed — the scheduler already watches pods, so the annotation rides
 the existing pod cache.

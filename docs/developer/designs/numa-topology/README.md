@@ -9,28 +9,29 @@ NIC resources onto a single NUMA node.
 
 The scheduler consumes the [`NodeResourceTopology`][nrt-api] (NRT) CRD, which is published
 per-node by an external exporter (NFD topology-updater or the resource-topology-exporter).
-A new `numa` plugin replicates the kubelet's `single-numa-node` admission check against the
-NRT data as a **filter predicate**, and tracks per-NUMA-zone consumption **within a scheduling
-cycle** so that multiple pods placed on the same node in one cycle are not over-committed onto
-the same zone. Compensating for NRT *staleness across cycles* is an optional extension
+A new `numa` plugin replicates the kubelet's Topology Manager admission check — for both the
+`single-numa-node` and `restricted` policies — against the NRT data as a **filter predicate**,
+and tracks per-NUMA-zone consumption **within a scheduling cycle** so that multiple pods placed
+on the same node in one cycle are not over-committed onto the same zone. Compensating for NRT *staleness across cycles* is an optional extension
 ([Appendix A](#appendix-a-optional-cross-cycle-staleness-compensation)), not part of v1.
 
 ## Motivation
 
 The kubelet's Topology Manager makes the real NUMA-alignment decision at **pod admission
-time**, after the scheduler has already chosen a node. When a node is configured with the
-`single-numa-node` policy and a Guaranteed pod's resources cannot all be satisfied from one
-NUMA node, the kubelet rejects the pod with a `TopologyAffinityError` and the pod returns to
-`Pending`. The scheduler then re-attempts — potentially picking the same bad node again —
-producing wasted cycles and, in the worst case, a hot loop.
+time**, after the scheduler has already chosen a node. When a node is configured with a restrictive
+policy like `single-numa-node`  or `restricted` and a Guaranteed pod's resources cannot all be satisfied according to it, the kubelet rejects the pod with a `TopologyAffinityError` and the pod returns to
+`Pending`. The scheduler then re-attempts — potentially (in most cases, likely) picking the same bad node again —
+producing wasted cycles and, in the worst case, a hot loop, and wasting the workload's time and precious compute resources.
 
 The scheduler cannot *enforce* NUMA alignment (the kubelet owns that), but it can *predict*
 it and avoid placing pods where the kubelet will reject them. This is the same role played
-by the upstream `NodeResourceTopologyMatch` plugin in kubernetes-sigs/scheduler-plugins.
+by the upstream [`NodeResourceTopologyMatch`][nrt-match] plugin in kubernetes-sigs/scheduler-plugins.
 
 The highest-value case for KAI is GPU locality: strict GPU↔CPU↔NIC NUMA affinity (e.g. for
-GPUDirect RDMA) materially affects throughput for AI/ML workloads, and is exactly the
-`single-numa-node` scenario.
+GPUDirect RDMA) materially affects throughput for AI/ML workloads. That is the `single-numa-node`
+scenario (everything on one NUMA node) and, for workloads larger than one NUMA node, the
+`restricted` scenario (the minimal NUMA span) — both of which the kubelet enforces by rejecting
+mismatched placements, and which this plugin therefore predicts.
 
 ## Usage Stories
 
@@ -49,69 +50,104 @@ several single-GPU Guaranteed pods on it in one scheduling cycle. Without per-zo
 KAI's whole-node accounting can approve a layout the kubelet cannot honor. In-cycle NUMA-zone
 reservation ensures each successive pod sees the reduced per-zone headroom.
 
+### Full-node workloads that span multiple NUMA nodes
+
+A large training pod requests most or all of a node — e.g. all 8 GPUs (with matching CPU and
+memory) on a node whose 8 GPUs are split 4+4 across two NUMA nodes. It physically cannot fit on a
+single NUMA node, so `single-numa-node` would reject it everywhere. The node is configured
+`restricted`, under which the kubelet admits it pinned to the *minimal* NUMA span (here, both
+nodes) — the correct and performant placement for a full-node job. KAI must predict that
+`restricted` verdict to place the pod without wasted scheduling cycles. This is why v1 models
+`restricted` faithfully (the hint merge) rather than treating it as `single-numa-node`: full-node
+GPU workloads are common, and they are inherently multi-NUMA.
+
 ## Goals
 
-- Consume the `NodeResourceTopology` CRD and attach it to the scheduler snapshot.
-- Implement a `numa` plugin that filters out nodes where the kubelet would reject a
-  Guaranteed, whole-GPU pod under the `single-numa-node` policy.
-- Track per-NUMA-zone resource consumption **within a scheduling cycle** so pods placed in
-  the same cycle do not over-commit a zone.
-- Restrict NUMA reasoning to an explicit, configurable allowlist of resources
-  (default `nvidia.com/gpu`, `cpu`, `memory`, plus configured NIC resources).
-- Leave the kubelet as the source of truth and enforcement point; the plugin is an
-  optimization layer only.
+These are the objectives of NUMA-aware scheduling as a whole; The implementation will be done in stages, described later in the document.
 
-## Non-Goals (v1)
+- **Prevent wasted scheduling from NUMA mismatches.** Don't place a pod on a node where the
+  kubelet's Topology Manager will reject it on topology grounds — eliminating the `Pending`
+  bounce and reschedule hot-loop that follow.
+- **Enable NUMA locality for performance on `best-effort` nodes where achievable.** For nodes
+  with the kubelet **`best-effort`** policy — which never rejects on topology grounds but may
+  silently run workloads *unaligned* when resources cannot co-locate on one NUMA node — steer
+  topology-sensitive pods (e.g. GPU↔CPU↔NIC) toward nodes where alignment can succeed, preferring
+  alignable placements over ones that would not, without ever blocking when locality is
+  unachievable ([v2](#v2-optimization--scoring); v1 leaves `best-effort` nodes as pass-through).
+- **Remain a safe optimization layer; never compromise correctness.** The kubelet stays the
+  source of truth and the enforcement point; this feature only reduces churn and improves
+  placement, and attempts to never cause an incorrect or mis-pinned placement.
+- **Stay correct under concurrency and preemption.** Concurrent placement decisions must not
+  over-commit a NUMA zone, and preempting or reclaiming for a topology-sensitive pod must avoid
+  evicting victims that would not actually free a usable aligned slot.
+- **Keep adoption cost low.** Build on the standard `NodeResourceTopology` tooling already common
+  in the ecosystem; require no mandatory new cluster components, keeping richer accuracy and
+  broader policy coverage as opt-in enhancements.
+
+## Non-Goals
 
 - **Fractional / MIG GPU sharing.** Only whole-GPU (`RequestTypeRegular`, integer
   `nvidia.com/gpu`) Guaranteed pods are handled. Shared-GPU pods are typically not
   Guaranteed QoS, so the kubelet Topology Manager does not align them.
-- **Faithful `restricted` policy modeling.** `restricted` permits multi-NUMA spreads; modeling
-  it requires reproducing the kubelet's cross-provider hint merge. v1 maps `restricted` →
-  `single-numa-node` (conservative — see *Policy handling*). A full design for faithful
-  `restricted` is in [v2](#v2-faithful-restricted-via-reimplemented-hint-merge).
-- **Cross-cycle NRT staleness compensation.** A freshly-bound pod is reflected in NRT only once
-  the exporter republishes. In practice that is near-real-time — both exporters push
-  **event-driven** updates on kubelet allocation changes (see *Deployment guidance*) — but it can
-  lag up to the **periodic** refresh (default 60s) if event updates are disabled or delayed. v1
-  does not compensate for any residual lag; the in-cycle layer only guards a single cycle. An
-  optional design is in [Appendix A](#appendix-a-optional-cross-cycle-staleness-compensation).
-- **NUMA scoring.** Preferring nodes with tighter NUMA fit is a follow-on; v1 is filter-only.
-- **Changes to the binder / `BindRequest`.** The kubelet performs the actual NUMA pinning for
-  whole-GPU Guaranteed pods via the device plugins; no device selection is communicated.
-- **Extending the resource vectors** to represent per-NUMA pools.
+- **100% prevention of kubelet pod rejections.** The current implementation of NUMA topology is inherently split-brained: the kubelet decides the actual placement of pods, while the scheduler attempts to predict that and match it's decisions. While we can probably approximate it pretty well and cover for some gaps like inter-cycle allocations, some mismatches might still occur, like when foreign (non kai-scheduler) pods are bound to nodes, or many pods are bound concurrently (NUMA allocation can be affected by order). The design aims to mitigate those cases as much as possible, and to be **self-healing**: when mismatches occur, we aim for the scheduler to be **eventually consistent** with the real state, so errors will not be carried for many cycles.
 
 ## Background: who decides NUMA alignment
 
 The **kubelet Topology Manager** implements every policy (`none`, `best-effort`,
 `restricted`, `single-numa-node`) and enforces it at admission, independently of the
-scheduler. NUMA alignment therefore works correctly with zero scheduler support — absent a
-scheduler plugin, you simply get more admission failures and reschedule churn.
+scheduler. So with zero scheduler support the kubelet still guarantees *correctness* — no pod is
+ever NUMA-misaligned.
 
-The scheduler plugin exists only to reduce that churn. This means:
+But correctness is not usability. The kubelet only *rejects*; it never *finds* a valid
+placement. Without a NUMA-aware scheduler the failure mode potentially severely degrades the cluster usability:
 
-- **Correctness is the kubelet's.** A bug or gap in this plugin can cause extra reschedules,
-  never a mis-pinned pod.
-- The plugin only needs to target the cases where prediction is cheap and failures common —
-  which is exactly `single-numa-node`.
+- A pod whose node can't NUMA-align it bounces to `Pending`, and the scheduler — seeing that node
+  as fine by whole-node accounting — keeps re-selecting it, so the pod **hot-loops or stays
+  Pending indefinitely even though the cluster has capacity**.
+- GPUs that are free by count but not NUMA-placeable become **stranded** — effective capacity
+  loss on the most scarce and expensive resource in the cluster.
+- The repeated bind → reject → reschedule traffic is **scheduler/binder thrash** that degrades
+  scheduling latency for *all* workloads, not just the NUMA-sensitive ones.
+- To users it looks like a pod that "should fit" mysteriously won't run, with an opaque
+  `TopologyAffinityError` — hard to diagnose, and corrosive to trust in the scheduler.
+
+The scheduler plugin's job is to restore usability on top of the kubelet's correctness: predict
+the kubelet's verdict so pods land where they can actually run, and free capacity is actually
+usable.
 
 ## Design Details
 
-### Policy handling (conservative)
+The work is staged into two phases plus optional enhancements:
 
-| NRT policy on node | v1 behavior |
+- **v1 — correctness (this section).** A **filter** that predicts the kubelet's admission verdict
+  for the two policies that *reject* on topology grounds (`single-numa-node` and `restricted`),
+  plus **within-cycle per-zone reservation** so pods placed together in one cycle stay consistent.
+  The aim is purely to prevent the wasted cycles and stranded capacity from *Background* — pods
+  land where they can actually run. `best-effort` and `none` are pass-through.
+- **v2 — optimization & scoring** ([Optimization & scoring](#v2-optimization--scoring)). Adds
+  *performance*: ranks feasible nodes (least fragmentation / fewest NUMA nodes) and steers
+  `best-effort` workloads toward nodes where alignment will actually succeed. It reuses v1's
+  evaluators and per-zone model and only **ranks** — it never changes the admit decision.
+- **Optional accuracy add-ons.** Neither is required for v1 to function: a cross-cycle staleness
+  cache ([Appendix A](#appendix-a-optional-cross-cycle-staleness-compensation)) and a per-node
+  placement agent ([Appendix B](#appendix-b-optional-per-node-numa-placement-agent)) that replaces
+  predicted placement with observed placement.
+
+The rest of this section describes **v1**.
+
+### Policy handling
+
+| Kubelet Topology Manager [policy][tm] on node (via NRT) | v1 behavior |
 | --- | --- |
-| `single-numa-node` | Fully modeled: require one NUMA zone to satisfy all allowlisted requests. |
-| `restricted` | **Mapped to `single-numa-node`** (conservative). Stricter than the kubelet — may reject a genuinely multi-NUMA pod the kubelet would accept, but provably never causes a `TopologyAffinityError`. |
-| `best-effort`, `none` | Pass (no constraint). |
+| [`single-numa-node`][tm-single-numa-node] | Fully modeled: require **one** NUMA zone to satisfy all the pod's NUMA-relevant requests (the `\|M\|=1` case of the merge below). |
+| [`restricted`][tm-restricted] | Fully modeled: admit iff a common minimal-width NUMA mask satisfies all the pod's NUMA-relevant requests (the general merge — see *Modeling `restricted`*). |
+| [`best-effort`][tm-best-effort] | Pass (kubelet never rejects on topology grounds). [v2](#v2-optimization--scoring) adds node scoring to steer toward alignable placements. |
+| [`none`][tm-none] | Pass (plugin no-op; Topology Manager performs no alignment). |
 | No NRT object for node | Pass (cluster without NRT is unaffected). |
 
-The `restricted` mapping is a single policy-normalization step; flipping it to "skip"
-(upstream behavior) is a one-line change if the conservative behavior proves too strict.
-The admit decision is isolated behind a `numaEvaluator` seam (see *Policy evaluator seam*)
-so the faithful `restricted` evaluator from
-[v2](#v2-faithful-restricted-via-reimplemented-hint-merge) can be slotted in without
-disturbing the v1 path.
+Both modeled policies are different cases of the same admit question and are implemented behind
+a single `numaEvaluator` seam (see *Policy evaluator seam*): `single-numa-node` is the
+single-zone special case; `restricted` allows the minimal multi-zone span the kubelet would.
 
 ### NRT ingestion
 
@@ -119,8 +155,7 @@ disturbing the v1 path.
    (`pkg/scheduler/cache/cluster_info/data_lister`) and register the informer in
    `kubernetes_lister.go`.
 2. In `cluster_info.Snapshot()`, attach the raw `*NodeResourceTopology` (matched by node
-   name) to the corresponding `NodeInfo` as a pointer field. **No resource-vector changes** —
-   this is a raw reference only.
+   name) to the corresponding `NodeInfo` as a pointer field.
 
 This keeps ingestion consistent with KAI's deterministic, snapshot-based scheduling and
 testability, while leaving the vector model untouched.
@@ -145,13 +180,14 @@ type nodeTopology struct {
     policy        tmPolicy
     scope         tmScope
     zones         []*numaZone               // NRT zones of Type == "Node"
-    topologyAware sets.Set[v1.ResourceName] // allowlist ∩ resources reported per-zone
+    topologyAware sets.Set[v1.ResourceName] // resources this node reports per-zone, minus denylist
 }
 
 type numaPlugin struct {
-    allowlist sets.Set[v1.ResourceName]    // configurable; default {gpu, cpu, memory, nics}
-    nodes     map[string]*nodeTopology     // rebuilt each OnSessionOpen; nil entry ⇒ pass
-    reserved  map[common_info.PodID]string // task UID → chosen zone id (for exact restore)
+    denylist  sets.Set[v1.ResourceName]      // optional; resources reported per-zone but NOT aligned
+                                             // (e.g. cpu/memory when their manager is off). Default empty.
+    nodes     map[string]*nodeTopology       // rebuilt each OnSessionOpen; nil entry ⇒ pass
+    reserved  map[common_info.PodID][]string // task UID → charged zone id(s); 1 for single-numa, ≥1 for restricted
 }
 ```
 
@@ -161,28 +197,65 @@ snapshot's NRT data each cycle, and `reserved` tracks only the current cycle's i
 allocations. v1 keeps no cross-cycle state (see
 [Appendix A](#appendix-a-optional-cross-cycle-staleness-compensation)).
 
-### Resource allowlist
+### NUMA-relevant resources
 
-A resource constrains placement only if it is **both** in the configured allowlist **and**
-reported per-zone in the node's NRT object. Default allowlist: `nvidia.com/gpu`, `cpu`,
-`memory`, plus operator-configured NIC resource names. This converts the one thing the
-scheduler cannot infer from NRT — whether a device's plugin actually emits NUMA hints — into
-explicit configuration, and keeps the per-zone math over a small, predictable set.
+Which resources constrain zone selection is decided **per node**, by what that node's NRT object
+reports per-zone, intersected with what the pod requests:
+
+```
+topologyAware(node) = { r : some zone of node reports r }  ∩  { r : pod requests r }
+```
+
+This is deliberately *not* a configured closed allow-list. A closed list is a correctness hazard:
+omit a resource the kubelet actually aligns and the plugin ignores it per-zone, placing pods the
+kubelet then rejects — the admission errors v1 exists to prevent. Inferring from NRT errs the
+other way (it may *over*-constrain), which only costs some false rejections, never admission
+errors — the safe direction for v1.
+
+- **Devices (GPU, NICs):** fully inferred. A device appears per-zone in NRT *only because* its
+  plugin emitted NUMA topology — exactly when the kubelet will align it — so per-zone reporting is
+  a faithful signal, with no configuration. Heterogeneous clusters work automatically: a device is
+  NUMA-constrained on nodes that report it per-zone and ignored on nodes that don't (correct —
+  those nodes won't NUMA-align it either). *Caveat:* if a node should publish per-zone device
+  topology but doesn't (exporter gap), the plugin reverts to no per-zone prediction there and
+  relies on the kubelet backstop — an observability concern (alert on rejecting-policy nodes with
+  no per-zone device data), not a correctness one.
+- **`cpu` / `memory`:** reported per-zone *unconditionally*, but the kubelet only aligns `cpu` when
+  its [CPU Manager policy is `static`][cpu-mgr] and `memory` when the [Memory Manager is
+  enabled][mem-mgr] (`Static`, not the default `None`). **NRT exposes neither manager's policy**
+  (only the Topology Manager policy/scope), so the plugin cannot infer whether they are actually
+  aligned. It therefore treats `cpu`/`memory` as aligned **by default** — the admission-error-safe
+  choice (under-including a resource the kubelet *does* align would cause rejections). The cost is
+  over-rejection on nodes whose manager is off; because **Memory Manager defaults to `None`**, a
+  `single-numa-node` node that aligns CPU+devices but lets memory float is a real case where
+  treating `memory` as aligned over-rejects.
+- **Optional denylist** (the only configuration): an operator who knows a reported resource is
+  *not* aligned on their nodes (e.g. `memory` with Memory Manager `None`, or `cpu` without
+  `static`) lists it, excluding it from per-zone reasoning and recovering the over-rejected
+  capacity. A denylist can only *relax* constraints, so it never introduces admission errors;
+  default is empty.
+
+(The QoS gate still applies — `cpu`/`memory`/`hugepages` constrain only Guaranteed pods, matching
+the kubelet, which aligns them only for Guaranteed QoS.)
+
+> **Future work:** upstream a `cpuManagerPolicy` / `memoryManagerPolicy` NRT attribute (none
+> exists today — exporters publish only the Topology Manager policy/scope). With it, `cpu`/`memory`
+> alignment becomes inferable per node and the denylist can be dropped.
 
 ### `shouldHandle` gate
 
 The plugin engages for a task only when **all** hold (otherwise the predicate passes
 through):
 
-- node has a `nodeTopology` entry with policy `singleNUMANode` (post-normalization), and
+- node has a `nodeTopology` entry whose policy is `singleNUMANode` or `restricted`, and
 - `task.Pod.Status.QoSClass == Guaranteed`, and
 - whole-GPU request: `task.ResourceRequestType == RequestTypeRegular` and integer
   `nvidia.com/gpu` (i.e. `!IsFractionCandidate() && !IsMigCandidate()`).
 
-### Filter algorithm
+### Filter algorithm: `single-numa-node`
 
-Following the upstream `single-numa-node` approach: a bitmask intersection rather than a
-hint merge.
+`single-numa-node` is the simple case — a bitmask intersection (the `|M|=1` special case of the
+general merge in *Modeling `restricted`*). Following the upstream approach:
 
 ```
 resourcesAvailableInAnyZone(nt, req):       // req limited to nt.topologyAware
@@ -203,7 +276,7 @@ suitable(qos, r, qty, avail):
 
 - **`pod` scope** → align the whole pod to one zone. Use KAI's effective-pod-request
   computation (which already accounts for init containers and native sidecars), projected
-  onto the allowlist, and run `resourcesAvailableInAnyZone` once.
+  onto the NUMA-relevant set, and run `resourcesAvailableInAnyZone` once.
 - **`container` scope** → align each container independently but sharing zone headroom. Run
   the check per container on a scratch copy of the zones, subtracting the chosen zone's
   resources after each container (greedy, first-fit lowest zone). This matches the upstream
@@ -214,6 +287,69 @@ The predicate is **pure** (read-only); it never mutates `nodes`. It also runs on
 that already passed the existing whole-node vector gate, so it is naturally late in the
 funnel.
 
+### Modeling `restricted`: the hint merge
+
+`restricted` lets a pod span more than one NUMA node, but only when the alignment is the
+*minimal* one possible. To predict the kubelet's verdict, we reproduce its hint merge.
+
+A **hint** is `{NUMANodeAffinity bitmask, Preferred bool}` — a candidate set of NUMA nodes a
+hint provider (CPU/Memory/Device Manager) can satisfy its slice of the request from. Each
+provider lists the NUMA-node subsets that can supply its requested amount, marking
+`Preferred=true` on those using the **minimum** number of NUMA nodes the request physically
+needs. A hint is a candidate grouping, **not** an allocation — it names no specific device/core.
+
+The Topology Manager merges one hint per provider (`mergePermutation`): merged affinity is the
+**bitwise-AND** of the picked affinities, and is `Preferred` **iff all picked affinities are
+equal *and* all are individually preferred**. `restricted` admits **iff the best merged hint is
+`Preferred`**, which reduces to a clean, short-circuitable rule:
+
+> **`restricted` admits ⟺ there exists a NUMA-node mask `M` such that, for every NUMA-relevant
+> resource the pod requests, `M` is a preferred (minimal-width) satisfying hint for it.**
+
+`single-numa-node` is the special case `|M| = 1`. The kubelet's full
+`compare`/`BestNonPreferredAffinityCount` machinery only picks *which* non-preferred hint wins
+for `best-effort`; it is not needed for the `restricted` admit decision. On admission the kubelet
+stores `M` and each provider allocates **within** `M` — the per-zone split is not fixed, so any
+allocation drawing every resource from nodes in `M` is acceptable.
+
+**Worked examples** (node has 2 NUMA nodes):
+
+| Per-node capacity | Pod (Guaranteed) | Per-resource preferred masks | Common mask? | `restricted` verdict |
+| --- | --- | --- | --- | --- |
+| 4 GPU, 16 CPU | 6 GPU + 10 CPU | GPU `{0,1}`; CPU `{0}`/`{1}` | none (GPU needs 2, CPU needs 1) | **reject** |
+| 4 GPU, 16 CPU | 6 GPU + 24 CPU | GPU `{0,1}`; CPU `{0,1}` | `{0,1}` | **admit on `{0,1}`** |
+| 2 GPU, many CPU | 4 GPU + 1 CPU | GPU `{0,1}`; CPU `{0}`/`{1}` | none | **reject** |
+
+The third row is an instructive footgun: a 4-GPU pod that *could* run 2+2 with its single CPU
+anywhere is **rejected by the kubelet itself** under `restricted`, because the CPU's minimal
+width (1) disagrees with the GPU's (2). The only ways to run it are to raise the CPU (or memory)
+request above one node's capacity, or to use `best-effort`. The plugin faithfully reproduces this
+rejection — it does not (and must not) "fix" it.
+
+#### Reimplement the merge, don't import it
+
+The intricate part — the merge + `Preferred`/admit rule — is small (the admit short-circuit is a
+few dozen lines). Per-resource hint generation (enumerate NUMA-node subsets from per-zone
+`Available`, mark minimal-width preferred) is generic; there is **no vendor-specific hint code**
+in the kubelet (device hints are driven by per-device NUMA affinity, which NRT already encodes as
+per-zone counts). Importing `k8s.io/kubernetes/.../topologymanager` (an internal kubelet package)
+would couple KAI to unstable kubelet internals; upstream scheduler-plugins itself imports only
+`bitmask` and reimplements the rest. v1 does the same.
+
+#### Prior art
+
+- **kubernetes-sigs/scheduler-plugins:** its Filter enforces only `single-numa-node`;
+  `restricted`/`best-effort` pass through, leaving `restricted` to the kubelet. So it does **not**
+  pre-compute the `restricted` verdict at all.
+- **Volcano (`numa-aware`):** *does* pre-compute `restricted` distinctly (own `Numatopology` CRD +
+  node agent, kubelet-style merge). But it reasons over **CPU hints only** (no GPU/device
+  provider) and uses a *simplified* merge (drops the "all affinities equal" rule and the
+  `bestNonPreferredAffinityCount` tie-break), so its verdict can diverge from the real kubelet.
+
+This is why KAI reimplements the merge over its per-zone model and — unlike Volcano — drives it
+from **GPU/device** hints, the case that matters here. (Volcano's per-pod `assignRes` tracking is
+also close prior art for the [placement agent](../numa-placement-agent/README.md).)
+
 ### In-cycle reservation (EventHandler)
 
 Within-cycle correctness rides the existing session `EventHandler`
@@ -223,48 +359,89 @@ Within-cycle correctness rides the existing session `EventHandler`
 AllocateFunc(e):
     nt = nodes[e.Task.NodeName]
     if !shouldHandle(e.Task, nt): return
-    z = pickZone(nt, requests(e.Task))        // same fit the predicate accepted
-    decrement nt.zones[z] by requests(e.Task)
-    reserved[e.Task.UID] = z.id
+    zones = evaluate(nt, requests(e.Task)).zones   // 1 zone for single-numa, ≥1 for restricted
+    charge zones by requests(e.Task)               // restricted: split across the masked zones
+    reserved[e.Task.UID] = ids(zones)
 
 DeallocateFunc(e):
-    z = reserved[e.Task.UID]; if none: return
-    increment nt.zones[z] by requests(e.Task)
-    delete reserved[e.Task.UID]
+    zones = reserved[e.Task.UID]; if none: return
+    credit back zones; delete reserved[e.Task.UID]
 ```
+
+For `single-numa-node` this charges exactly one zone. For `restricted`, the chosen mask `M` may
+span several zones; the kubelet does not fix the per-zone split at admission, so the plugin uses
+an **approximate greedy split** across `M`'s zones (internal accounting only — see the
+reservation-split caveat in *Known Limitations*).
 
 Because the statement's undo path fires `DeallocateFunc` on rollback (and `AllocateFunc` on
 redo), preemption/reclaim scenario probing — which speculatively allocates and `Discard()`s —
-stays consistent automatically, with **no manual clone/restore**. Recording the chosen zone
-id (rather than recomputing it) guarantees the restore targets the exact zone even though
-headroom changed in between. The chosen zone is internal accounting only; it is never sent to
-the kubelet, which independently re-derives placement.
+stays consistent automatically, with **no manual clone/restore**. Recording the charged zone(s)
+(rather than recomputing them) guarantees the restore targets the exact zones even though
+headroom changed in between. The chosen zones are internal accounting only; they are never sent
+to the kubelet, which independently re-derives placement.
 
-This layer covers placement *within one cycle* only; it does **not** persist (speculative
-allocations from preemption probing must never leak into long-lived state). Across cycles, v1
-relies on the kubelet as the backstop and accepts the staleness window discussed in
-[Appendix A](#appendix-a-optional-cross-cycle-staleness-compensation).
+This layer is *within-cycle* and in-memory: speculative allocations from preemption probing must
+never leak into long-lived state. Only a **committed** bind persists its chosen zone — as the
+scheduler-predicted placement record, next.
+
+### Scheduler-predicted placement record
+
+`pickZone` produces a prediction of each pod's NUMA zone. v1 keeps that prediction in memory
+only (the `reserved` map) for the current cycle. Persisting it turns it into a durable, per-pod
+**zone ledger** that survives across cycles and across scheduler restarts:
+
+- **On commit only**, the chosen zone(s) are carried in the `BindRequest` (a new field, exactly
+  like `SelectedGPUGroups` / `ResourceClaimAllocations`), and the binder writes them to a pod
+  annotation (`kai.scheduler/numa-placement-predicted`). This piggybacks on the bind the binder
+  already performs — **no extra API writes** — and the `BindRequest` is added to the snapshot
+  store synchronously, so the prediction is readable the very next cycle. Speculative
+  (probed-then-discarded) allocations are never persisted.
+- **On later cycles**, the plugin reads each pod's recorded prediction instead of re-deriving
+  its zone. This is what makes the Appendix A reconstruction and the reclaim eviction-crediting
+  **stable**: a recorded prediction never drifts (a re-derived one does, and a restart re-derives
+  inconsistently). It is the persistent form of the per-pod ledger those mechanisms need.
+
+**Precedence: observed > predicted > re-derive.** This record is the scheduler's *prediction*,
+not ground truth. When the optional [placement agent](../numa-placement-agent/README.md) is
+present, its *observed* annotation supersedes this predicted one; without it, the predicted
+record is the best available per-pod zone — and still far better than re-deriving.
+
+**What it buys — and doesn't.** It improves *consistency and stability*, not accuracy versus the
+kubelet: a recorded prediction can still be wrong (the kubelet backstops), but it is *stably*
+wrong rather than drifting, and it survives restarts. It is the fallback when the placement agent
+is absent or lagging, and the substrate for complex multi-step in-cycle solves.
+
+**Observability.** When both a predicted and an observed record exist for a pod, compare them and
+emit a **prediction-accuracy** metric (predicted zone == observed zone?). This measures how
+faithfully `pickZone` mirrors the kubelet — i.e. how much the placement agent (or DRA) actually
+buys — and flags a divergent `pickZone` implementation.
 
 ### Policy evaluator seam
 
-The admit / zone-selection decision is isolated behind a small interface so v1's proven-safe
-path is untouched when faithful `restricted` ([v2](#v2-faithful-restricted-via-reimplemented-hint-merge))
-is added:
+Both policies' admit / zone-selection logic is isolated behind one interface, so the predicate
+and the reservation are policy-agnostic:
 
 ```go
 // evaluate returns whether the pod can be NUMA-aligned on this node, and the
 // zone(s) the in-cycle reservation should charge — one zone for single-numa-node,
-// potentially several for a faithful restricted merge.
+// one or more for a restricted merge.
 type numaEvaluator interface {
     evaluate(nt *nodeTopology, req resourceRequests) (zones []*numaZone, admit bool)
 }
 ```
 
-v1 ships a single `singleNUMAEvaluator` (the bitmask intersection above), used for both
-`single-numa-node` and the conservatively-mapped `restricted`. The predicate and the
-`AllocateFunc`/`DeallocateFunc` reservation both route through `evaluate` (the reservation
-charges the returned `zones`, which in v1 is always exactly one). Adding v2 is then a matter
-of registering a second evaluator and routing `restricted` nodes to it.
+v1 ships **two** evaluators, selected per node by its Topology Manager policy:
+- `singleNUMAEvaluator` — the bitmask intersection (`single-numa-node`); always returns one zone.
+- `restrictedEvaluator` — the hint merge (`restricted`); returns the chosen mask's zones.
+  It builds per-resource hints from per-zone `Available` via a small `resourceHinter` registry
+  (one generic counting hinter covers `nvidia.com/gpu` and `memory`; `cpu` needs care — see
+  *Known Limitations*) and searches for a common minimal-width mask. If some requested
+  topology-aware resource has no registered hinter, it falls back to `singleNUMAEvaluator` (a
+  safe, stricter rejection).
+
+The predicate and the `AllocateFunc`/`DeallocateFunc` reservation both route through `evaluate`
+and charge whatever zones it returns. v2's scoring layer reuses the same evaluators and per-zone
+model — it only adds ranking, never changes the admit decision.
 
 ### Registration
 
@@ -274,8 +451,8 @@ Register the builder in `pkg/scheduler/plugins/factory.go`:
 framework.RegisterPluginBuilder("numa", numa.New)
 ```
 
-and enable it in the scheduler plugin configuration. The allowlist and the
-`restricted`-handling mode are read from `PluginArguments`.
+and enable it in the scheduler plugin configuration. The only argument is the optional resource
+**denylist** (see *NUMA-relevant resources*), read from `PluginArguments`.
 
 ### Deployment guidance: NRT freshness vs. schedule period
 
@@ -331,149 +508,79 @@ regardless; Appendix A is the in-plugin fallback if the assumption proves insuff
   is implemented (Appendix B), reclaim predictions are not accurate** — they rely on
   prediction + the kubelet backstop. The worst case is a wasted eviction and a bounce, never a
   loop.
-- **`restricted` is over-strict** by design (mapped to `single-numa-node`).
+- **`restricted` weakens the no-error guarantee (by design).** `single-numa-node` filtering is
+  provably free of `TopologyAffinityError` (it is stricter than the kubelet). Modeling
+  `restricted` faithfully means *admitting* multi-NUMA pods, so any divergence from the kubelet
+  can cause a rejection. Two divergence sources:
+  - **Restricted reservation split is loose.** The kubelet does not fix the per-zone split at
+    admission, so the greedy split is approximate; under packing pressure a later pod in the same
+    cycle can still collide — a residual `TopologyAffinityError` risk that the single-zone charge
+    does not have.
+  - **CPU hint fidelity.** The count-based CPU hinter must match the CPU Manager's minimal width
+    (full physical cores / SMT). Since CPU's minimal width participates in the common-mask test, a
+    divergence can flip a `restricted` *admit* and cause a rejection. `restricted` is most
+    trustworthy when the **GPU** drives the multi-NUMA span. The hinter-coverage gate preserves
+    safety only for pods using unsupported resources, not supported-but-divergent ones.
+
+  In all cases the kubelet remains the backstop (a wasted reschedule, never a mis-pinned pod).
 
 ## Testing
 
 - **Unit**: policy/scope parsing from NRT attributes (and legacy `TopologyPolicies`); the
-  bitmask filter across single/multi-zone fits; QoS gating; allowlist intersection; pod- vs
-  container-scope; `shouldHandle` rejection of fractional/MIG/non-Guaranteed pods.
-- **Reservation**: in-cycle multi-pod placement on a multi-NUMA node; rollback consistency
-  through allocate → discard (preemption probing).
+  `single-numa-node` bitmask filter across single/multi-zone fits; QoS gating; per-node
+  NUMA-relevant inference (resource constrains iff reported per-zone) and denylist exclusion; pod-
+  vs container-scope; `shouldHandle` rejection of fractional/MIG/non-Guaranteed pods.
+- **`restricted` merge**: the worked examples above (admit on a common minimal-width mask;
+  reject when per-resource minimal widths disagree, incl. the 4-GPU+1-CPU footgun); hinter-
+  coverage fallback to `singleNUMAEvaluator`; multi-zone mask selection.
+- **Reservation**: in-cycle multi-pod placement on a multi-NUMA node (single- and multi-zone
+  charges); rollback consistency through allocate → discard (preemption probing).
 - **E2E** (with a Kind node exposing synthetic NRT objects): a Guaranteed whole-GPU pod is
   filtered off a node whose free GPU/CPU cannot co-locate, and placed on one where they can.
 
 ## Future Work
 
-- NUMA scoring (`AddNodeOrderFn`) to prefer least-fragmented placement.
 - Cross-cycle staleness compensation if the hot-loop proves real in practice — see
   [Appendix A](#appendix-a-optional-cross-cycle-staleness-compensation).
 - Fractional / MIG GPU support, if/when a meaningful kubelet alignment path exists.
-- Faithful `restricted` (multi-NUMA) support — see
-  [v2](#v2-faithful-restricted-via-reimplemented-hint-merge).
+- Upstream a `cpuManagerPolicy` / `memoryManagerPolicy` NRT attribute so `cpu`/`memory` alignment
+  can be inferred per node (today NRT exposes only the Topology Manager policy/scope), removing the
+  need for the resource denylist.
 
-## v2: Faithful `restricted` via reimplemented hint merge
+## v2: Optimization & scoring
 
-### Motivation and scope
+v1 decides *feasibility* — can this node host the pod without a `TopologyAffinityError`. v2
+decides *which feasible node is best*, via a node score (`AddNodeOrderFn`, a new band in
+`scores/scores.go`). It reuses v1's evaluators and per-zone model unchanged: it only **ranks**
+nodes, never alters the admit decision.
 
-`restricted` lets a pod span more than one NUMA node — but only when the alignment is the
-*minimal* one possible. v1 conservatively maps `restricted` → `single-numa-node`, which
-rejects any pod that genuinely needs ≥2 NUMA nodes. v2 reproduces the kubelet's admission
-decision so those pods can be placed.
+### What scoring adds
 
-The value is **narrow**: as the examples below show, `restricted` admits a multi-NUMA pod
-only when *every* topology-aware resource it requests independently needs the *same* minimal
-set of NUMA nodes. So v2 only unlocks **large, balanced** pods (e.g. many GPUs **and** enough
-CPU that both exceed single-node capacity). For the common "1 GPU + a little CPU + a NIC" pod
-every resource needs one node, so `restricted` and `single-numa-node` admit the same set and
-v2 adds nothing. Implement v2 only if large balanced multi-NUMA pods are real in the fleet.
+- **Optimize `best-effort` performance.** On a `best-effort` node the kubelet never rejects — it
+  silently runs the pod *unaligned* when it can't fit a NUMA node, costing throughput. v1 does
+  nothing for `best-effort` (there is no admission error to prevent). v2 **scores** `best-effort`
+  nodes by whether the pod's resources *can* be aligned there, steering it toward a node where
+  the kubelet's best-effort alignment will actually succeed — turning a silent performance loss
+  into a good placement. This is the primary motivation for v2.
+- **Prefer tighter, less-fragmented fit** on feasible `single-numa-node` / `restricted` nodes, so
+  later pods still find aligned room, and multi-NUMA pods span the fewest zones.
 
-### How the kubelet decides (the model v2 reproduces)
+### Scoring strategies
 
-A **hint** is `{NUMANodeAffinity bitmask, Preferred bool}` — a candidate set of NUMA nodes a
-hint provider (CPU Manager, Memory Manager, Device Manager) can satisfy its slice of the
-request from. Each provider lists the NUMA-node subsets that can supply its requested amount
-from per-zone availability, marking `Preferred=true` on those using the **minimum** number of
-NUMA nodes the request physically needs. A hint is a candidate grouping, **not** an
-allocation — it names no specific device or core.
+Reusing the upstream NodeResourceTopology scoring vocabulary, computed over the plugin's per-zone
+model:
 
-The Topology Manager merges one hint per provider (cross-product). For each permutation
-(`mergePermutation` in `k8s.io/kubernetes/.../topologymanager`):
+- **LeastNUMANodes** (policy-agnostic) — prefer nodes where the pod spans the fewest NUMA nodes
+  (ideally one). This is the core `best-effort` steering and the multi-NUMA-span minimizer.
+- **LeastAllocated / MostAllocated / BalancedAllocation** — spread vs. bin-pack vs. balance
+  per-zone utilization, for fragmentation control on the aligned policies; selectable via config.
 
-- merged affinity = **bitwise-AND** of the picked affinities;
-- merged is `Preferred` **iff all picked affinities are equal *and* all are individually
-  preferred** (the kubelet's "only mark preferred if all affinities are equal" rule).
+### Notes
 
-`restricted` admits **iff the best merged hint is `Preferred`**. Because the merge always
-prefers a preferred hint when one exists, this reduces to a clean, short-circuitable rule:
-
-> **`restricted` admits ⟺ there exists a NUMA-node mask `M` such that, for every
-> topology-aware resource the pod requests, `M` is a preferred (minimal-width) satisfying
-> hint for that resource.**
-
-`single-numa-node` is the special case `|M| = 1`, so v2 generalizes v1 from "find one zone
-that fits everything" to "find a common minimal-width mask." The full `compare` /
-`BestNonPreferredAffinityCount` machinery in the kubelet only selects *which* non-preferred
-hint wins for `best-effort`; it is not needed for the `restricted` admit decision.
-
-On admission the kubelet stores `M`, and each provider then allocates **within** `M`, picking
-specific devices/cores itself. The **per-zone split is not fixed at admission** — any
-allocation drawing every resource from nodes in `M` is acceptable.
-
-### Worked examples (node has 2 NUMA nodes)
-
-| Per-node capacity | Pod (Guaranteed) | Per-resource preferred masks | Common mask? | `restricted` verdict |
-| --- | --- | --- | --- | --- |
-| 4 GPU, 16 CPU | 6 GPU + 10 CPU | GPU `{0,1}`; CPU `{0}`/`{1}` | none (GPU needs 2, CPU needs 1) | **reject** |
-| 4 GPU, 16 CPU | 6 GPU + 24 CPU | GPU `{0,1}`; CPU `{0,1}` | `{0,1}` | **admit on `{0,1}`** |
-| 2 GPU, many CPU | 4 GPU + 1 CPU | GPU `{0,1}`; CPU `{0}`/`{1}` | none | **reject** |
-
-The third row is the instructive footgun: a 4-GPU pod that obviously *could* run 2+2 with its
-single CPU placed anywhere is **rejected by the kubelet itself** under `restricted`, because
-the CPU's minimal width (1) disagrees with the GPU's (2). The only ways to make it run are to
-raise the CPU (or memory) request above a single node's capacity so its minimal width also
-becomes 2, or to use `best-effort`. v2 faithfully reproduces this rejection — it does not (and
-must not) "fix" it.
-
-### Why reimplement rather than import
-
-The valuable, intricate part — the merge + `Preferred`/admit rule — is small (the admit
-short-circuit above is a few dozen lines). Per-resource hint generation (enumerate NUMA-node
-subsets from per-zone `Available`, mark minimal-width preferred) is generic; there is **no
-vendor-specific hint code** in the kubelet — device hints are generic, driven by per-device
-NUMA affinity, which NRT already encodes as per-zone counts. Importing
-`k8s.io/kubernetes/.../topologymanager` (an internal kubelet package) would couple KAI to
-unstable kubelet internals across versions; notably, upstream scheduler-plugins imports only
-`bitmask` and reimplements the rest. v2 follows that lead and reimplements the merge over the
-plugin's per-zone model.
-
-### Prior art: how others handle `restricted`
-
-- **kubernetes-sigs/scheduler-plugins (NodeResourceTopology):** its Filter enforces only
-  `single-numa-node`; for `restricted`/`best-effort` it passes through, leaving `restricted` to
-  the kubelet. Its Score's per-zone strategies are likewise `single-numa-node`-only — a separate,
-  policy-agnostic `LeastNUMANodes` strategy merely ranks nodes by NUMA span and is not
-  `restricted`-specific. So it does **not** pre-compute the `restricted` verdict.
-- **Volcano (`numa-aware` plugin):** *does* pre-compute `restricted` distinctly — it reads each
-  node's Topology Manager policy from its own `Numatopology` CRD (published by a Volcano node
-  agent), instantiates a dedicated restricted policy, runs a kubelet-style hint merge, and
-  rejects the node when the best merged hint is not `Preferred`. Two caveats relevant to KAI: it
-  reasons over **CPU hints only** (no GPU/device hint provider), and its merge is a *simplified*
-  variant of the kubelet's (it drops the "all affinities equal" preferred rule and the
-  `bestNonPreferredAffinityCount` tie-break), so its verdict can diverge from the real kubelet.
-
-This validates v2's direction — reimplement the merge (the kubelet packages are not cleanly
-importable) — while highlighting the gap KAI targets: **GPU/device** NUMA alignment, which
-Volcano's CPU-only plugin does not cover. Volcano's per-pod placement tracking (`assignRes`) plus
-its node agent is also close prior art for the
-[placement agent](../numa-placement-agent/README.md).
-
-### Implementation
-
-- A `resourceHinter` registry (the "mini-plugin" mechanism): per allowlisted resource,
-  generate `[]hint` from per-zone `Available`. One generic counting hinter covers
-  `nvidia.com/gpu` and `memory`; `cpu` needs care (full physical cores / SMT) — see caveats.
-- A `restrictedEvaluator` implementing `numaEvaluator`: build per-resource hints, search for a
-  common minimal-width mask `M` (the admit short-circuit), return `(zonesOf(M), admit)`.
-- Gate: route a `restricted` node to the `restrictedEvaluator` **only if every requested
-  topology-aware resource has a registered hinter**; otherwise fall back to the v1
-  conservative `singleNUMAEvaluator` (a safe, superset rejection).
-- Reservation: for a multi-zone `M`, charge the zones with an **approximate greedy split**.
-
-### v2 caveats
-
-- **Reservation split is inherently loose.** The kubelet itself does not fix the per-zone
-  split at admission (only the mask `M`), so the greedy charge approximates something left
-  open upstream. It prevents gross within-cycle over-placement, but a later pod in the same
-  cycle can still collide under packing pressure — a residual `TopologyAffinityError` risk
-  that v1's exact single-zone charge never had.
-- **CPU fidelity.** The count-based CPU hinter must match the CPU Manager's minimal width
-  (full physical cores / SMT under the static policy). Since CPU's minimal width participates
-  in the common-mask test, a divergence can flip an *admit* decision and cause a
-  `TopologyAffinityError`. v2 is most trustworthy when the **GPU** drives the multi-NUMA span.
-- **Loss of the safety guarantee.** Admitting multi-NUMA pods means divergence can cause a
-  `TopologyAffinityError`; v1's conservative path provably cannot. The hinter-coverage gate
-  preserves safety only for pods using unsupported resources, not supported-but-divergent ones.
+- Scoring runs on the same predicted per-zone state as v1, so the prediction caveats carry over —
+  but a score is only a *preference*, so a misprediction costs ranking quality, never correctness.
+- `best-effort` scoring is the one place the plugin touches `best-effort` nodes at all; v1 leaves
+  them untouched, and the admit decision for `single-numa-node` / `restricted` is unchanged.
 
 ## Appendix A: (optional) cross-cycle staleness compensation
 
@@ -534,8 +641,9 @@ So a dirty node is served a **reconstructed** view rather than being dropped:
   reflecting *every* pod on the node (ours or not). No prediction.
 - **Dirty node (mismatch):** reconstruct per-zone availability from the snapshot,
   `available[zone] = capacity[zone] − Σ predicted_occupancy[zone]` over **all** NUMA pods on the
-  node (`capacity` = static per-zone NRT `Allocatable`; each pod assigned a predicted zone via
-  the evaluator). Used only while dirty; the next match reverts to NRT.
+  node (`capacity` = static per-zone NRT `Allocatable`; each pod's zone taken from its persisted
+  *scheduler-predicted placement record* where available — stable across cycles and restarts —
+  else re-derived via the evaluator). Used only while dirty; the next match reverts to NRT.
 
 The fingerprint gate is what makes reconstruction safe: it is **transient**, so it cannot drift
 permanently the way an *ungated* reconstruction would (one that never defers to ground truth and
@@ -593,6 +701,14 @@ predicting it: per-zone occupancy becomes exact, victim evictions credit the rea
 reclaim simulation is accurate. When absent, the plugin falls back to prediction — so the agent
 is purely additive and can be enabled independently, after v1.
 
+[tm]: https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/
+[tm-none]: https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/#policy-none
+[tm-best-effort]: https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/#policy-best-effort
+[tm-restricted]: https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/#policy-restricted
+[tm-single-numa-node]: https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/#policy-single-numa-node
+[cpu-mgr]: https://kubernetes.io/docs/tasks/administer-cluster/cpu-management-policies/
+[mem-mgr]: https://kubernetes.io/docs/tasks/administer-cluster/memory-manager/
+[nrt-match]: https://github.com/kubernetes-sigs/scheduler-plugins/blob/master/pkg/noderesourcetopology/README.md
 [nrt-api]: https://github.com/k8stopologyawareschedwg/noderesourcetopology-api
 [nfd-tu]: https://github.com/kubernetes-sigs/node-feature-discovery/blob/master/pkg/nfd-topology-updater/kubeletnotifier/kubeletnotifier.go
 [rte]: https://github.com/k8stopologyawareschedwg/resource-topology-exporter/blob/main/pkg/notification/notification.go
