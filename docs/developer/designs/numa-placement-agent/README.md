@@ -9,11 +9,13 @@ the [NUMA scheduler plugin](../numa-topology/README.md) consumes this *observed*
 instead of *predicting* it — making its per-zone accounting, and in particular its
 reclaim/preemption simulation, accurate.
 
-This component is **not part of the NUMA plugin v1**. The plugin works without it (using
-predicted placement); the agent is an accuracy upgrade that can be enabled later. It is also a
-deliberate **stopgap for the device-plugin + Topology Manager world** — under Dynamic Resource
-Allocation the scheduler already knows real placement (see *Superseded long-term by DRA*) — and
-the capability it provides is being built upstream (see *Prior art*).
+This agent is **part of the NUMA plugin v1**, and the scheduler is built to consume its input from
+day one — but **deploying it is optional**: the plugin works without it on a predicted-placement
+fallback, so the agent is an accuracy upgrade rather than a hard dependency (the KAI operator
+deploys it automatically when the `numa` plugin is enabled). It is also a deliberate **stopgap for
+the device-plugin + Topology Manager world** — under Dynamic Resource Allocation the scheduler
+already knows real placement (see *Superseded long-term by DRA*) — and the capability it provides
+is being built upstream (see *Prior art*).
 
 ## Motivation
 

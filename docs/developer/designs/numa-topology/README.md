@@ -117,13 +117,19 @@ usable.
 
 ## Design Details
 
-The work is staged into two phases plus optional enhancements:
+The work is staged into two phases (plus a v3 idea, and one optional enhancement —
+cross-cycle staleness, [Appendix A](#appendix-a-optional-cross-cycle-staleness-compensation)):
 
 - **v1 — correctness (this section).** A **filter** that predicts the kubelet's admission verdict
   for the two policies that *reject* on topology grounds (`single-numa-node` and `restricted`),
   plus **within-cycle per-zone reservation** so pods placed together in one cycle stay consistent.
   The aim is to prevent the wasted cycles and stranded capacity from *Background* — pods
   land where they can actually run. `best-effort` and `none` are pass-through.
+- **Observed placement (v1).** A per-node agent publishes each pod's *actual* NUMA placement; the
+  scheduler consumes it for exact per-zone accounting (and accurate reclaim) when available, and
+  **falls back to its own prediction when the agent is absent or lagging**. The agent ships with
+  v1, but deploying it is optional — the scheduler degrades gracefully without it. See *Observed
+  placement: the per-node agent*.
 - **v2 — optimization & scoring** ([Optimization & scoring](#v2-optimization--scoring)). Adds
   *performance*: ranks feasible nodes (least fragmentation / fewest NUMA nodes) and steers
   `best-effort` workloads toward nodes where alignment will actually succeed. It reuses v1's
@@ -377,9 +383,26 @@ only (the `reserved` map) for the current cycle. Persisting it turns it into a d
   inconsistently). It is the persistent form of the per-pod ledger those mechanisms need. 
 
 **Precedence: observed > predicted > re-derive.** This record is the scheduler's *prediction*,
-not ground truth. When the optional [placement agent](../numa-placement-agent/README.md) is
-present, its *observed* annotation supersedes this predicted one; without it, the predicted
-record is the best available per-pod zone — and still far better than re-deriving.
+not ground truth. When the per-node placement agent (next) has published a pod's *observed*
+placement, that supersedes this predicted one; when the agent is absent or hasn't reported a pod
+yet, the predicted record is the best available per-pod zone.
+
+### Observed placement: the per-node agent
+
+Prediction is only as good as the scheduler's `pickZone` matching the kubelet's actual choice. To
+make per-zone accounting (and especially reclaim) *exact*, v1 also consumes the **observed**
+placement produced by a per-node agent — a DaemonSet that reads the kubelet **podresources API**,
+derives each pod's actual per-NUMA-zone resource placement, and publishes it as a pod annotation
+(`kai.scheduler/numa-placement-observed`). When present, the plugin uses observed placement
+directly: occupancy is exact, victim evictions credit the *real* zone, and reclaim simulation is
+accurate. When absent or not-yet-reported (agent undeployed, lagging, or pod just bound), the
+plugin falls back to the predicted record, then to re-derivation — so the agent is **purely
+additive**: it improves accuracy without being a hard dependency, and the scheduler is built to
+handle its input from day one.
+
+The agent ships with v1, and the operator deploys it automatically when the `numa` plugin is
+enabled (see *Operator integration*), but a cluster can run without it on the prediction
+fallback. Full design: [Per-Node NUMA Placement Agent](../numa-placement-agent/README.md).
 
 ### Policy evaluator seam
 
@@ -458,14 +481,14 @@ regardless; Appendix A is the in-plugin fallback if the assumption proves insuff
   the assumption holds in practice; documented as a divergence source.
 - **Greedy container-scope packing** is order-sensitive and an approximation of the kubelet's
   per-container hint merge. Exact in the common single-GPU-container case.
-- **Reclaim-simulation accuracy.** The scheduler never observes a pod's *actual* NUMA zone (NRT
-  is aggregate per-zone only); it predicts it. So reclaim/preemption of NUMA pods is simulated
-  on predicted victim zones and can occasionally waste an eviction when the pending pod needs
+- **Reclaim-simulation accuracy depends on the placement agent.** NRT is aggregate per-zone only,
+  so without observed placement the scheduler *predicts* each pod's zone; reclaim/preemption then
+  runs on predicted victim zones and can occasionally waste an eviction when the pending pod needs
   multiple per-zone-scarce resources co-located (GPU-bound pods with abundant per-zone CPU are
-  largely immune). **Until the optional [per-node NUMA placement agent](../numa-placement-agent/README.md)
-  is implemented (Appendix B), reclaim predictions are not accurate** — they rely on
-  prediction + the kubelet backstop. The worst case is a wasted eviction and a bounce, never a
-  loop.
+  largely immune). With the [per-node placement agent](../numa-placement-agent/README.md) deployed
+  (a v1 component — see *Observed placement*), victim zones are *observed* and reclaim is accurate;
+  **when the agent is absent or lagging the scheduler falls back to prediction**, where the worst
+  case is a wasted eviction and a bounce, never a loop.
 
 ## Testing
 
@@ -540,6 +563,45 @@ model:
   but a score is only a *preference*, so a misprediction costs ranking quality, never correctness.
 - `best-effort` scoring is the one place the plugin touches `best-effort` nodes at all; v1 leaves
   them untouched, and the admit decision for `single-numa-node` / `restricted` is unchanged.
+
+## v3: Pod-level NUMA policy (scheduler-enforced)
+
+*A direction for future discussion — not yet designed. API and mechanics are open; this section
+only records the idea.*
+
+Today NUMA intent is a property of the **node**: the kubelet's Topology Manager policy applies to
+every pod on it, all-or-nothing. That leaves two gaps — `best-effort` gives no alignment guarantee
+to workloads that want one, while `restricted` / `single-numa-node` force alignment on *every*
+Guaranteed pod (including ones that don't care) and carry the request-inflation quirk.
+
+v3 would make NUMA intent a property of the **workload**: on a permissive (`best-effort` / `none`)
+node, a performance-sensitive pod declares its own NUMA constraint and the scheduler enforces it by
+placement, while other pods on the same node stay unconstrained. Mechanically this reuses v1's
+machinery — drive the evaluator from a per-pod declaration instead of the node policy — and relies
+on the kubelet's `best-effort` aligner (which still aligns when it can) to deliver the pinning.
+
+Two properties make it attractive:
+
+- **Softer failure mode than v1.** A `best-effort` kubelet never rejects, so a scheduler
+  misprediction yields an *unaligned* pod (a throughput hit), never a `TopologyAffinityError` or a
+  stuck `Pending`.
+- **Pod-granularity NUMA requirements.** Like network topology, the sensitivity to NUMA placement 
+  should be a property of the workload, and specifically, of the pod. This implementation lets
+  the users express their wokrloads' requirements, instead of having the admin config this globally.
+- **Per-resource granularity.** A workload could ask to align only what it cares about (e.g. GPU
+  and NIC, not CPU), sidestepping the node-level all-resource merge that drives `restricted`'s
+  request-inflation quirk.
+
+**Honest limitation — not a hard guarantee.** Because a `best-effort` kubelet never rejects, the
+scheduler cannot provide a *kubelet-enforced* guarantee; it offers a strong placement preference
+(place only where alignment is achievable, plus reservation) and the kubelet best-effort path
+delivers it. A true "align or don't run" guarantee would additionally need the
+[placement agent](../numa-placement-agent/README.md) to observe actual placement and re-place on a
+miss (verify-and-heal).
+
+This also lines up with where Kubernetes is heading — **DRA**, where workloads express device and
+topology constraints and the scheduler allocates against them; v3 is a KAI-native precursor to that
+model.
 
 ## Appendix A: (optional) cross-cycle staleness compensation
 
@@ -621,9 +683,10 @@ scenario (speculatively) evicts it — so NUMA-pod reclaim scenarios succeed wit
 The prediction need only be **internally consistent**, not match the kubelet: a wrong victim
 zone just means the pending pod is pipelined onto a zone label differing from where the kubelet
 actually frees a GPU — but a GPU *did* free, so the kubelet still admits it. Mispredicted zones
-cost internal precision, never correctness. The optional
-[per-node NUMA placement agent](../numa-placement-agent/README.md) (Appendix B) removes the
-prediction entirely by reporting each pod's *observed* zone, making reclaim simulation exact.
+cost internal precision, never correctness. The
+[per-node placement agent](../numa-placement-agent/README.md) (v1 — see *Observed placement*)
+removes the prediction entirely by reporting each pod's *observed* zone, making reclaim simulation
+exact.
 
 ### Caveats and the no-fingerprint fallback
 
@@ -641,24 +704,6 @@ prediction entirely by reporting each pod's *observed* zone, making reclaim simu
   KAI_exact_node_free` (KAI's whole-node free never lags); it auto-decays as NRT catches up.
   The drift warning applies specifically to *ungated* reconstruction — with no fingerprint to
   snap back to NRT, predicting all pods' zones every cycle never defers to ground truth.
-
-## Appendix B: (optional) per-node NUMA placement agent
-
-**Status: optional, not part of v1.** Full design:
-[Per-Node NUMA Placement Agent](../numa-placement-agent/README.md).
-
-The scheduler never observes a pod's actual NUMA zone — NRT is aggregate per-zone only — so the
-plugin *predicts* placement. Prediction is fine for filtering (the kubelet backstops admission)
-but makes reclaim simulation inexact: **until this agent exists, reclaim predictions for NUMA
-pods are not accurate** (they rely on predicted victim zones + the kubelet backstop; worst case
-is a wasted eviction, see *Reclaim-simulation accuracy* in Known Limitations).
-
-The agent is a per-node DaemonSet that reads the kubelet **podresources API**, derives each
-pod's actual per-zone resource placement, and publishes it as a pod annotation
-(`kai.scheduler/numa-placement`). When present, the plugin uses *observed* placement instead of
-predicting it: per-zone occupancy becomes exact, victim evictions credit the real zone, and
-reclaim simulation is accurate. When absent, the plugin falls back to prediction — so the agent
-is purely additive and can be enabled independently, after v1.
 
 ## Operator integration (intent)
 
